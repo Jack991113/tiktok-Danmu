@@ -1,5 +1,72 @@
 TikTok Danmu Public - Config Guide
 
+====================
+中文说明
+====================
+
+这个公开版不使用：
+- 授权码
+- 管理员 Token
+- 管理员客户端
+- 服务器中转
+
+用户需要填写的内容：
+
+1. 直播间地址
+- TikTok 直播间链接
+
+2. Sign API Base
+- 默认值：
+  https://tiktok.eulerstream.com
+- 如果你使用别的签名服务，就填写对应服务地址
+
+3. Sign API Key
+- 填写你自己的有效 Sign API Key
+- 这不是授权码
+- 这不是管理员 Token
+
+4. 使用 Sign API Key
+- 建议开启
+
+5. 代理
+- 可选
+- 如果直连没问题，可以留空
+- 示例：
+  http://127.0.0.1:7890
+  socks5://127.0.0.1:7890
+
+6. 代理路由模式
+- direct：全部直连
+- all：TikTok 和 Sign API 都走代理
+- tiktok_only：只有 TikTok 走代理
+- sign_only：只有 Sign API 走代理
+
+7. 打印设置
+- 选择打印机
+- 设置纸张尺寸
+- 根据需要调整模板、字体、画布
+
+这个公开版固定行为：
+- 仅本地监听
+- 无授权激活
+- 无后台管理
+- 无远程永久编号同步
+- 无云数据中心
+
+配置文件路径：
+- %LOCALAPPDATA%\SenNails\app_settings_public.json
+
+典型使用步骤：
+1. 填写直播间地址
+2. 填写 Sign API Base
+3. 填写 Sign API Key
+4. 保存配置
+5. 开始监听
+
+====================
+English
+====================
+
 This public build does not use:
 - license code
 - admin token
@@ -9,7 +76,7 @@ This public build does not use:
 What the user needs to fill in:
 
 1. Live URL
-- TikTok live room URL or room link
+- TikTok live room URL
 
 2. Sign API Base
 - Default:
@@ -40,7 +107,7 @@ What the user needs to fill in:
 7. Printer Settings
 - select printer
 - set paper size
-- set design template and font as needed
+- adjust template, font, and canvas as needed
 
 What is fixed in this public build:
 - local listen mode only
@@ -50,7 +117,7 @@ What is fixed in this public build:
 - no cloud data center
 
 Settings file path:
-- %LOCALAPPDATA%\\SenNails\\app_settings_public.json
+- %LOCALAPPDATA%\SenNails\app_settings_public.json
 
 Typical usage:
 1. Fill live URL
