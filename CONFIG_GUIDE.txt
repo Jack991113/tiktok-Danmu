@@ -1,0 +1,60 @@
+TikTok Danmu Public - Config Guide
+
+This public build does not use:
+- license code
+- admin token
+- admin client
+- server relay
+
+What the user needs to fill in:
+
+1. Live URL
+- TikTok live room URL or room link
+
+2. Sign API Base
+- Default:
+  https://tiktok.eulerstream.com
+- If you use another sign service, fill in that service base URL instead
+
+3. Sign API Key
+- Fill in your own valid Sign API Key
+- This is not a license code
+- This is not an admin token
+
+4. Use Sign API Key
+- Recommended: enabled
+
+5. Proxy
+- Optional
+- Leave empty if direct connection works
+- Example:
+  http://127.0.0.1:7890
+  socks5://127.0.0.1:7890
+
+6. Proxy Route Mode
+- direct: all direct
+- all: TikTok and Sign API use proxy
+- tiktok_only: only TikTok uses proxy
+- sign_only: only Sign API uses proxy
+
+7. Printer Settings
+- select printer
+- set paper size
+- set design template and font as needed
+
+What is fixed in this public build:
+- local listen mode only
+- no license activation
+- no backend management
+- no remote permanent ID sync
+- no cloud data center
+
+Settings file path:
+- %LOCALAPPDATA%\\SenNails\\app_settings_public.json
+
+Typical usage:
+1. Fill live URL
+2. Fill Sign API Base
+3. Fill Sign API Key
+4. Save config
+5. Start listening
