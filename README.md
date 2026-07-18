@@ -11,6 +11,16 @@ Public TikTok comment-printing build for GitHub
 
 这是一个独立的 TikTok 弹幕打印公开版仓库，用于公开发布源码和本地使用。
 
+### Windows EXE 下载
+
+请在 [GitHub Releases](https://github.com/Jack991113/tiktok-Danmu/releases/latest) 下载：
+
+- `TikTokDanmuPrinter.exe`：Windows 64 位单文件程序
+- `TikTokDanmuPrinter-v1.0.0-Windows-x64.zip`：程序与使用说明完整包
+- `SHA256SUMS.txt`：文件完整性校验值
+
+当前 EXE 未使用商业代码签名证书，Windows SmartScreen 可能在首次运行时显示提示。
+
 这个版本已经主动移除所有后台管理和授权体系，适合：
 
 - 本地单机使用

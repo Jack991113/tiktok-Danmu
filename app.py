@@ -69,6 +69,7 @@ def _default_runtime_dir() -> str:
 RUNTIME_DIR = _default_runtime_dir()
 DATA_DIR = os.path.join(RUNTIME_DIR, "prints")
 APP_FLAVOR_NAME = os.path.splitext(os.path.basename(sys.argv[0] if sys.argv else "app.py"))[0].lower()
+APP_RELEASE_VERSION = "1.0.0"
 APP_IS_PUBLIC_BUILD = True
 APP_IS_SERVER_RELAY_BUILD = "server_relay" in APP_FLAVOR_NAME
 APP_IS_ARCHIVE_BUILD = ("archive" in APP_FLAVOR_NAME) or ("_ab" in APP_FLAVOR_NAME)
@@ -393,6 +394,8 @@ def format_print_output(
 
 
 def get_app_version() -> str:
+    if APP_RELEASE_VERSION:
+        return APP_RELEASE_VERSION
     try:
         out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
         return out or "dev"
