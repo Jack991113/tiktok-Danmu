@@ -7,6 +7,18 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 
+SENSITIVE_BROWSER_COOKIE_NAMES = frozenset({
+    "sessionid",
+    "sessionid_ss",
+    "sid_guard",
+    "sid_tt",
+    "sid_tt_ss",
+    "tt-target-idc",
+    "uid_tt",
+    "uid_tt_ss",
+})
+
+
 class BrowserSessionError(RuntimeError):
     pass
 
@@ -24,6 +36,14 @@ def build_live_room_url(unique_id: str) -> str:
     if not uid:
         raise ValueError("直播间主播 ID 不能为空")
     return f"https://www.tiktok.com/@{uid}/live"
+
+
+def filter_sensitive_browser_cookies(cookies: Dict[str, str]) -> Dict[str, str]:
+    return {
+        str(name): str(value)
+        for name, value in dict(cookies or {}).items()
+        if str(name).lower() not in SENSITIVE_BROWSER_COOKIE_NAMES
+    }
 
 
 class BrowserSessionManager:
@@ -179,11 +199,11 @@ class BrowserSessionManager:
 
     @staticmethod
     def _auth_state(context: Any, page: Any, warning: str = "") -> BrowserAuthState:
-        cookies = {
+        cookies = filter_sensitive_browser_cookies({
             str(item.get("name", "")): str(item.get("value", ""))
             for item in context.cookies("https://www.tiktok.com")
             if item.get("name")
-        }
+        })
         user_agent = ""
         page_url = ""
         if page is not None and not page.is_closed():

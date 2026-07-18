@@ -51,6 +51,7 @@ import license_client
 import security_utils
 import browser_session
 import comment_rules
+import listener_modes
 
 
 def _default_runtime_dir() -> str:
@@ -69,7 +70,7 @@ def _default_runtime_dir() -> str:
 RUNTIME_DIR = _default_runtime_dir()
 DATA_DIR = os.path.join(RUNTIME_DIR, "prints")
 APP_FLAVOR_NAME = os.path.splitext(os.path.basename(sys.argv[0] if sys.argv else "app.py"))[0].lower()
-APP_RELEASE_VERSION = "1.0.0"
+APP_RELEASE_VERSION = "1.0.1"
 APP_IS_PUBLIC_BUILD = True
 APP_IS_SERVER_RELAY_BUILD = "server_relay" in APP_FLAVOR_NAME
 APP_IS_ARCHIVE_BUILD = ("archive" in APP_FLAVOR_NAME) or ("_ab" in APP_FLAVOR_NAME)
@@ -135,8 +136,7 @@ PROXY_ROUTE_MODE_OPTIONS = [
 PROXY_ROUTE_MODE_LABEL_TO_VALUE = {label: value for label, value in PROXY_ROUTE_MODE_OPTIONS}
 PROXY_ROUTE_MODE_VALUE_TO_LABEL = {value: label for label, value in PROXY_ROUTE_MODE_OPTIONS}
 LISTEN_SOURCE_MODE_OPTIONS = [
-    ("本机直连", "local"),
-    ("浏览器会话", "browser"),
+    *listener_modes.PUBLIC_LISTEN_MODE_OPTIONS,
     ("服务器中转", "relay"),
 ]
 LISTEN_SOURCE_MODE_LABEL_TO_VALUE = {label: value for label, value in LISTEN_SOURCE_MODE_OPTIONS}
@@ -476,7 +476,11 @@ class App:
             ttk.Label(frm, text="服务器中转（已锁定）").grid(row=0, column=9, sticky=tk.W, padx=(4, 0))
             self.listen_source_mode_var.set(LISTEN_SOURCE_MODE_VALUE_TO_LABEL["relay"])
         else:
-            listen_options = ["本机直连", "浏览器会话"] if APP_IS_PUBLIC_BUILD else [label for label, _value in LISTEN_SOURCE_MODE_OPTIONS]
+            listen_options = (
+                [label for label, value in LISTEN_SOURCE_MODE_OPTIONS if value in listener_modes.PUBLIC_LISTEN_MODES]
+                if APP_IS_PUBLIC_BUILD
+                else [label for label, _value in LISTEN_SOURCE_MODE_OPTIONS]
+            )
             self.listen_source_mode_cb = ttk.Combobox(
                 frm,
                 textvariable=self.listen_source_mode_var,
@@ -574,10 +578,18 @@ class App:
             self.use_sign_api_var.set(0)
         else:
             ttk.Label(frm, text="Sign API Base:").grid(row=3, column=0, sticky=tk.W)
-            ttk.Entry(frm, textvariable=self.sign_api_base_var, width=28).grid(row=3, column=1, columnspan=2, sticky=tk.W)
+            self.sign_api_base_entry = ttk.Entry(frm, textvariable=self.sign_api_base_var, width=28)
+            self.sign_api_base_entry.grid(row=3, column=1, columnspan=2, sticky=tk.W)
             ttk.Label(frm, text="Sign API Key:").grid(row=3, column=3, sticky=tk.E)
-            ttk.Entry(frm, textvariable=self.sign_api_key_var, width=26, show="*").grid(row=3, column=4, sticky=tk.W)
-            ttk.Checkbutton(frm, text="使用 Sign API Key 连接", variable=self.use_sign_api_var, command=self._request_save_settings).grid(row=3, column=5, columnspan=2, padx=6, sticky=tk.W)
+            self.sign_api_key_entry = ttk.Entry(frm, textvariable=self.sign_api_key_var, width=26, show="*")
+            self.sign_api_key_entry.grid(row=3, column=4, sticky=tk.W)
+            self.use_sign_api_check = ttk.Checkbutton(
+                frm,
+                text="使用 Sign API Key 连接",
+                variable=self.use_sign_api_var,
+                command=self._request_save_settings,
+            )
+            self.use_sign_api_check.grid(row=3, column=5, columnspan=2, padx=6, sticky=tk.W)
         self.license_btn = ttk.Button(frm, text=("配置说明" if APP_IS_PUBLIC_BUILD else "激活授权"), command=self.activate_license)
         self.license_btn.grid(row=2, column=5, padx=6)
         if not APP_IS_PUBLIC_BUILD:
@@ -585,8 +597,10 @@ class App:
             self.customer_front_btn.grid(row=2, column=6, padx=6)
         self.license_state_var = tk.StringVar(value=("公开版: 无需授权" if APP_IS_PUBLIC_BUILD else "授权状态: 未校验"))
         ttk.Label(frm, textvariable=self.license_state_var).grid(row=2, column=7, columnspan=2, sticky=tk.W)
+        self.listen_mode_hint_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.listen_mode_hint_var).grid(row=4, column=0, columnspan=10, sticky=tk.W)
         self.status_var = tk.StringVar(value="状态: 未连接")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=4, column=0, columnspan=10, sticky=tk.W, pady=(4, 0))
+        ttk.Label(frm, textvariable=self.status_var).grid(row=5, column=0, columnspan=10, sticky=tk.W, pady=(4, 0))
 
         # Printers and sizes
         printer_frm = ttk.Frame(root)
@@ -941,7 +955,7 @@ class App:
         self._setup_input_shortcuts()
         self.custom_name_var.trace_add("write", lambda *_: self._request_save_settings())
         self.room_url_var.trace_add("write", lambda *_: self._request_save_settings())
-        self.listen_source_mode_var.trace_add("write", lambda *_: self._request_save_settings())
+        self.listen_source_mode_var.trace_add("write", self._on_listen_source_mode_change)
         self.proxy_var.trace_add("write", lambda *_: self._request_save_settings())
         self.proxy_enabled.trace_add("write", lambda *_: self._request_save_settings())
         self.proxy_route_mode_var.trace_add("write", lambda *_: self._on_proxy_route_mode_change())
@@ -956,6 +970,7 @@ class App:
         self.sign_api_base_var.trace_add("write", lambda *_: self._request_save_settings())
         self.sign_api_key_var.trace_add("write", lambda *_: self._request_save_settings())
         self.use_sign_api_var.trace_add("write", lambda *_: self._request_save_settings())
+        self._update_listen_mode_controls()
         try:
             if not tracemalloc.is_tracing():
                 tracemalloc.start()
@@ -1011,8 +1026,8 @@ class App:
 
     def _encode_settings_payload(self, data: dict) -> dict:
         payload = dict(data or {})
-        if APP_IS_SECURE_BUILD:
-            for key in SENSITIVE_SETTINGS_KEYS:
+        for key in SENSITIVE_SETTINGS_KEYS:
+            if key in payload:
                 payload[key] = security_utils.protect_secret(payload.get(key, ""))
         return payload
 
@@ -1808,6 +1823,32 @@ tick(); setInterval(tick, 3000);
         if raw in LISTEN_SOURCE_MODE_VALUE_TO_LABEL:
             return raw
         return "local"
+
+    def _on_listen_source_mode_change(self, *_):
+        self._update_listen_mode_controls()
+        self._request_save_settings()
+
+    def _update_listen_mode_controls(self):
+        mode = self._get_listen_source_mode()
+        listening = bool(getattr(self, "listening", False))
+        if hasattr(self, "listen_source_mode_cb"):
+            self.listen_source_mode_cb.config(state=(tk.DISABLED if listening else "readonly"))
+
+        api_controls_enabled = mode == "api" and not listening and not APP_IS_SIGNPOOL_RELAY_BUILD
+        control_state = tk.NORMAL if api_controls_enabled else tk.DISABLED
+        for widget_name in ("sign_api_base_entry", "sign_api_key_entry", "use_sign_api_check"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.config(state=control_state)
+
+        hints = {
+            "api": "API 接口：使用下方 Sign API Base/Key 连接",
+            "local": "本机直连：无需填写 Key；TikTokLive 仍使用默认公共签名服务",
+            "browser": "浏览器会话：打开 Chrome 并复用非敏感会话信息，不传递登录 Cookie",
+            "relay": "服务器中转：由服务端统一建立直播连接",
+        }
+        if hasattr(self, "listen_mode_hint_var"):
+            self.listen_mode_hint_var.set(hints.get(mode, hints["local"]))
 
     def _get_listen_source_mode(self) -> str:
         if APP_IS_SIGNPOOL_RELAY_BUILD:
@@ -2761,11 +2802,24 @@ tick(); setInterval(tick, 3000);
 
         threading.Thread(target=worker, name="open-live-browser", daemon=True).start()
 
-    def _start_listener_for_uid(self, unique_id: str, worker_map=None, group_stop_event=None, source_tag: str = "main", enable_print: bool = True, browser_mode: bool = False):
+    def _start_listener_for_uid(self, unique_id: str, worker_map=None, group_stop_event=None, source_tag: str = "main", enable_print: bool = True, listen_mode: str = "local"):
         workers = worker_map if isinstance(worker_map, dict) else self.listener_workers
         stop_group = group_stop_event if group_stop_event is not None else self._stop_event
         if unique_id in workers:
             return
+        normalized_listen_mode = self._normalize_listen_source_mode(listen_mode)
+        configured_sign_base = self.sign_api_base_var.get().strip() if hasattr(self, "sign_api_base_var") else DEFAULT_SIGN_API_BASE
+        configured_sign_key = self.sign_api_key_var.get().strip() if hasattr(self, "sign_api_key_var") else ""
+        use_configured_sign_key = bool(self.use_sign_api_var.get()) if hasattr(self, "use_sign_api_var") else False
+        sign_api_base, sign_api_key = listener_modes.resolve_sign_settings(
+            normalized_listen_mode,
+            configured_sign_base,
+            configured_sign_key,
+            use_configured_sign_key,
+            DEFAULT_SIGN_API_BASE,
+        )
+        browser_mode = normalized_listen_mode == "browser"
+        has_sign_key = bool(sign_api_key)
         stop_evt = threading.Event()
         holder = {"client": None}
 
@@ -2785,12 +2839,6 @@ tick(); setInterval(tick, 3000);
                     pass
             proxy_mode = self._get_proxy_route_mode()
             proxy = self._resolve_configured_proxy() if proxy_mode != "direct" else ""
-            sign_api_key = self.sign_api_key_var.get().strip() if hasattr(self, "sign_api_key_var") else ""
-            sign_api_base = self.sign_api_base_var.get().strip() if hasattr(self, "sign_api_base_var") else DEFAULT_SIGN_API_BASE
-            sign_api_base = str(sign_api_base or DEFAULT_SIGN_API_BASE).strip().rstrip("/")
-            use_sign_api = bool(self.use_sign_api_var.get()) if hasattr(self, "use_sign_api_var") else bool(sign_api_key)
-            has_saved_sign_key = bool(sign_api_key)
-            has_sign_key = bool(use_sign_api and has_saved_sign_key)
             use_tiktok_proxy = bool(proxy and self._proxy_applies_to_tiktok(proxy_mode))
             use_sign_proxy = bool(proxy and self._proxy_applies_to_sign(proxy_mode))
             if proxy:
@@ -2921,12 +2969,6 @@ tick(); setInterval(tick, 3000);
                     if proxy and use_tiktok_proxy and (proxy_refused or "all connection attempts failed" in err_lower):
                         use_tiktok_proxy = False
                         self.queue.put((None, None, f"{unique_id} TikTok 代理不可用，已改直连重试", datetime.now().isoformat(), False, unique_id, source_tag))
-                        time.sleep(0.5)
-                        continue
-                    if has_saved_sign_key and (not has_sign_key) and sign_error:
-                        has_sign_key = True
-                        max_backoff = 90.0
-                        self.queue.put((None, None, f"{unique_id} 已自动启用 Sign API Key 重试连接", datetime.now().isoformat(), False, unique_id, source_tag))
                         time.sleep(0.5)
                         continue
                     if "rate_limit" in err_lower or "eulerstream.com/pricing" in err_lower:
@@ -3155,6 +3197,7 @@ tick(); setInterval(tick, 3000);
                     self.stop_btn.config(state=tk.DISABLED)
                 except Exception:
                     pass
+                self._update_listen_mode_controls()
                 self._set_status(reason or "已停止")
         else:
             try:
@@ -3174,6 +3217,7 @@ tick(); setInterval(tick, 3000);
             self.stop_btn.config(state=tk.DISABLED)
         except Exception:
             pass
+        self._update_listen_mode_controls()
         for uid, w in list(self.listener_workers.items()):
             try:
                 w["stop"].set()
@@ -5536,6 +5580,7 @@ tick(); setInterval(tick, 3000);
                     group_stop_event=self._analysis_stop_event,
                     source_tag="analysis",
                     enable_print=False,
+                    listen_mode=("local" if self._get_listen_source_mode() == "relay" else self._get_listen_source_mode()),
                 )
             self._set_status(f"分析监听中: {', '.join('@'+u for u in self.analysis_listener_workers.keys())}")
             self._refresh_overlap_view()
@@ -9723,6 +9768,15 @@ tick(); setInterval(tick, 3000);
         if listen_mode == "relay" and (not self._license_server_url() or not self._license_key()):
             messagebox.showwarning("提示", "服务器中转监听必须先填写授权码")
             return
+        if listen_mode == "api":
+            sign_base = self.sign_api_base_var.get().strip()
+            parsed_sign_base = urllib.parse.urlparse(sign_base)
+            if parsed_sign_base.scheme not in ("http", "https") or not parsed_sign_base.netloc:
+                messagebox.showwarning("提示", "API 接口模式需要有效的 Sign API Base（http:// 或 https://）")
+                return
+            if bool(self.use_sign_api_var.get()) and not self.sign_api_key_var.get().strip():
+                messagebox.showwarning("提示", "已选择使用 Sign API Key，请先填写 Key")
+                return
         if not self._ensure_license_active(show_dialog=True):
             return
         self._save_settings()
@@ -9738,6 +9792,7 @@ tick(); setInterval(tick, 3000);
             self.stop_btn.config(state=tk.NORMAL)
         except Exception:
             pass
+        self._update_listen_mode_controls()
         new_count = 0
         for uid in unique_ids:
             if uid in self.listener_workers:
@@ -9750,16 +9805,22 @@ tick(); setInterval(tick, 3000);
             if listen_mode == "relay":
                 self._start_relay_listener_for_uid(uid)
             else:
-                self._start_listener_for_uid(uid, browser_mode=(listen_mode == "browser"))
+                self._start_listener_for_uid(uid, listen_mode=listen_mode)
             new_count += 1
         active = ", ".join("@"+u for u in self.listener_workers.keys())
-        self._set_status(f"监听中: {active}")
+        mode_label = LISTEN_SOURCE_MODE_VALUE_TO_LABEL.get(listen_mode, "本机直连")
+        self._set_status(f"监听中[{mode_label}]: {active}")
         self._audit("start_listen", ",".join(unique_ids))
         self._track_business_event("listen_start", {"input_count": len(unique_ids), "active_rooms": list(self.listener_workers.keys())})
         self._sync_local_permanent_ids_backup("start_listen")
         if new_count > 0:
             messagebox.showinfo("开始", f"新增监听 {new_count} 个直播间")
         else:
+            if not self.listener_workers:
+                self.listening = False
+                self.connect_btn.config(state=tk.NORMAL)
+                self.stop_btn.config(state=tk.DISABLED)
+                self._update_listen_mode_controls()
             messagebox.showinfo("提示", "这些直播间已在监听中")
 
     def _poll(self):

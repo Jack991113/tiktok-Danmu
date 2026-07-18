@@ -35,6 +35,19 @@ jobs:
         shell: pwsh
         run: python -m unittest discover -s tests -v
 
+      - name: Validate release metadata
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $appVersion = (python -c "import app; print(app.get_app_version())").Trim()
+          if ($tag -ne "v$appVersion") {
+            throw "Tag $tag does not match app version $appVersion."
+          }
+          $notesFile = "docs\RELEASE_NOTES_$tag.md"
+          if (-not (Test-Path $notesFile)) {
+            throw "Release notes not found: $notesFile"
+          }
+
       - name: Build executable
         shell: pwsh
         run: .\build_windows.ps1 -Name "TikTokDanmuPrinter"
@@ -94,6 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $notesFile = "docs\RELEASE_NOTES_$tag.md"
           $assets = @(
             "dist\TikTokDanmuPrinter.exe",
             "release\TikTokDanmuPrinter-$tag-Windows-x64.zip",
@@ -106,6 +120,6 @@ jobs:
           } else {
             gh release create $tag @assets `
               --title "TikTok 弹幕打印 $tag" `
-              --notes-file "docs\RELEASE_NOTES_v1.0.0.md" `
+              --notes-file $notesFile `
               --verify-tag
           }

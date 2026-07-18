@@ -16,7 +16,7 @@ Public TikTok comment-printing build for GitHub
 请在 [GitHub Releases](https://github.com/Jack991113/tiktok-Danmu/releases/latest) 下载：
 
 - `TikTokDanmuPrinter.exe`：Windows 64 位单文件程序
-- `TikTokDanmuPrinter-v1.0.0-Windows-x64.zip`：程序与使用说明完整包
+- `TikTokDanmuPrinter-v1.0.1-Windows-x64.zip`：程序与使用说明完整包
 - `SHA256SUMS.txt`：文件完整性校验值
 
 当前 EXE 未使用商业代码签名证书，Windows SmartScreen 可能在首次运行时显示提示。
@@ -70,7 +70,13 @@ py -3.10 -m pip install -r requirements.txt -r requirements-win.txt
 py -3.10 app.py
 ```
 
-浏览器会话模式需要电脑已安装 Google Chrome。在“监听模式”选择“浏览器会话”后点击开始监听，程序会打开真实直播间页面，并复用浏览器 Cookie 和 User-Agent 建立弹幕连接。浏览器登录状态保存在本机 `%LOCALAPPDATA%\SenNails\tiktok_browser_profile`，不要将该目录上传或分享。
+监听模式：
+
+- `API 接口`：使用填写的 `Sign API Base/Key`。
+- `本机直连`：忽略已保存的自定义 Key，直接连接 TikTok；TikTokLive 底层仍需要默认公共签名服务。
+- `浏览器会话`：打开真实 Chrome 直播间，复用 User-Agent 和非敏感 Cookie，不会将 `sessionid` 等登录凭据交给签名服务。
+
+浏览器会话模式需要电脑已安装 Google Chrome。浏览器资料保存在本机 `%LOCALAPPDATA%\SenNails\tiktok_browser_profile`，不要将该目录上传或分享。
 
 ### 热敏纸实寸打印
 
@@ -184,7 +190,13 @@ py -3.10 -m pip install -r requirements.txt -r requirements-win.txt
 py -3.10 app.py
 ```
 
-Browser-session mode requires Google Chrome. Select `浏览器会话` in the listening-mode selector and start listening. The app opens the real LIVE room and reuses that browser session's cookies and user agent for the comment connection. Browser login state stays on the local machine and must not be uploaded or shared.
+Listening modes:
+
+- `API 接口`: uses the configured `Sign API Base/Key`.
+- `本机直连`: ignores a saved custom key and connects directly to TikTok; TikTokLive still needs its default public signing service.
+- `浏览器会话`: opens the real room in Chrome and reuses its user agent and non-sensitive cookies without forwarding login credentials such as `sessionid` to the signing service.
+
+Browser-session mode requires Google Chrome. Its profile stays in `%LOCALAPPDATA%\SenNails\tiktok_browser_profile` and must not be uploaded or shared.
 
 ### Physical-size thermal printing
 

@@ -22,7 +22,9 @@ def _blob_from_bytes(value: bytes) -> _DataBlob:
     if not value:
         return _DataBlob(0, None)
     buffer = ctypes.create_string_buffer(value)
-    return _DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    blob = _DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    blob._buffer_ref = buffer
+    return blob
 
 
 def _bytes_from_blob(blob: _DataBlob) -> bytes:
