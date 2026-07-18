@@ -49,6 +49,8 @@ import db
 import printer_utils
 import license_client
 import security_utils
+import browser_session
+import comment_rules
 
 
 def _default_runtime_dir() -> str:
@@ -115,6 +117,8 @@ CANVAS_PAYLOAD_MARKER_PREFIX = "[[SEN_CANVAS_PAYLOAD="
 SETTINGS_SAVE_DEBOUNCE_MS = 450
 POLL_MAX_BATCH = 120
 POLL_MAX_SLICE_MS = 120
+COMMENT_QUEUE_MAXSIZE = 20000
+PRINT_PREFETCH_MAX = 20
 DEFAULT_SIGN_API_BASE = "https://tiktok.eulerstream.com"
 FIXED_LICENSE_SERVER_URL = ""
 FIXED_CLOUD_ADMIN_SERVER_URL = ""
@@ -131,6 +135,7 @@ PROXY_ROUTE_MODE_LABEL_TO_VALUE = {label: value for label, value in PROXY_ROUTE_
 PROXY_ROUTE_MODE_VALUE_TO_LABEL = {value: label for label, value in PROXY_ROUTE_MODE_OPTIONS}
 LISTEN_SOURCE_MODE_OPTIONS = [
     ("本机直连", "local"),
+    ("浏览器会话", "browser"),
     ("服务器中转", "relay"),
 ]
 LISTEN_SOURCE_MODE_LABEL_TO_VALUE = {label: value for label, value in LISTEN_SOURCE_MODE_OPTIONS}
@@ -254,7 +259,7 @@ VAR_DOCS = [
 ]
 
 # Canvas designer unit mapping: store/render in internal units, edit as mm.
-CANVAS_UNITS_PER_MM = 5.0
+CANVAS_UNITS_PER_MM = printer_utils.CANVAS_UNITS_PER_MM
 FONT_FAMILY_CHOICES = [
     "TkDefaultFont",
     "Arial",
@@ -429,6 +434,7 @@ class App:
         self.root = root
         self.app_version = get_app_version()
         self.settings = self._load_settings()
+        self._settings_restore_pending_restart = False
         self._save_settings_after_id = None
         self._debounce_jobs = {}
         self.ui_language = "zh"
@@ -456,22 +462,22 @@ class App:
         self._i18n_widgets.append((self.lbl_live_url, "live_url"))
         self.room_url_var = tk.StringVar(value=str(self.settings.get("room_url", "")))
         ttk.Entry(frm, textvariable=self.room_url_var, width=35).grid(row=0, column=3)
-        saved_listen_mode = "local" if APP_IS_PUBLIC_BUILD else ("relay" if APP_IS_SIGNPOOL_RELAY_BUILD else str(self.settings.get("listen_source_mode", "local")).strip().lower())
+        saved_listen_mode = "relay" if APP_IS_SIGNPOOL_RELAY_BUILD else str(self.settings.get("listen_source_mode", "local")).strip().lower()
         if saved_listen_mode not in LISTEN_SOURCE_MODE_VALUE_TO_LABEL:
             saved_listen_mode = "relay" if APP_IS_SIGNPOOL_RELAY_BUILD else "local"
+        if APP_IS_PUBLIC_BUILD and saved_listen_mode == "relay":
+            saved_listen_mode = "local"
         ttk.Label(frm, text="监听模式:").grid(row=0, column=8, sticky=tk.E)
         self.listen_source_mode_var = tk.StringVar(value=LISTEN_SOURCE_MODE_VALUE_TO_LABEL.get(saved_listen_mode, "本机直连"))
-        if APP_IS_PUBLIC_BUILD:
-            ttk.Label(frm, text="本机直连（公开版）").grid(row=0, column=9, sticky=tk.W, padx=(4, 0))
-            self.listen_source_mode_var.set(LISTEN_SOURCE_MODE_VALUE_TO_LABEL["local"])
-        elif APP_IS_SIGNPOOL_RELAY_BUILD:
+        if APP_IS_SIGNPOOL_RELAY_BUILD:
             ttk.Label(frm, text="服务器中转（已锁定）").grid(row=0, column=9, sticky=tk.W, padx=(4, 0))
             self.listen_source_mode_var.set(LISTEN_SOURCE_MODE_VALUE_TO_LABEL["relay"])
         else:
+            listen_options = ["本机直连", "浏览器会话"] if APP_IS_PUBLIC_BUILD else [label for label, _value in LISTEN_SOURCE_MODE_OPTIONS]
             self.listen_source_mode_cb = ttk.Combobox(
                 frm,
                 textvariable=self.listen_source_mode_var,
-                values=[label for label, _value in LISTEN_SOURCE_MODE_OPTIONS],
+                values=listen_options,
                 width=12,
                 state="readonly",
             )
@@ -511,8 +517,7 @@ class App:
         else:
             ttk.Label(frm, text="网络路由:").grid(row=1, column=0, sticky=tk.W)
             ttk.Label(frm, text="已由服务端统一管理").grid(row=1, column=1, columnspan=3, sticky=tk.W)
-        # Stability-first default: disable SSL verification unless user explicitly turns it off.
-        self.ssl_insecure_var = tk.IntVar(value=1 if bool(self.settings.get("ssl_insecure", True)) else 0)
+        self.ssl_insecure_var = tk.IntVar(value=1 if bool(self.settings.get("ssl_insecure", False)) else 0)
         self.chk_ssl_insecure = ttk.Checkbutton(frm, text=self._t("ssl_insecure"), variable=self.ssl_insecure_var)
         self.chk_ssl_insecure.grid(row=1, column=4, padx=6)
         self._i18n_widgets.append((self.chk_ssl_insecure, "ssl_insecure"))
@@ -530,6 +535,8 @@ class App:
         self.rule_btn = ttk.Button(frm, text=self._t("rule_center"), command=self.open_rule_center)
         self.rule_btn.grid(row=1, column=5, padx=6)
         self._i18n_widgets.append((self.rule_btn, "rule_center"))
+        self.browser_btn = ttk.Button(frm, text="打开直播间浏览器", command=self.open_live_browser)
+        self.browser_btn.grid(row=1, column=8, padx=6)
         if not APP_IS_PUBLIC_BUILD:
             self.admin_btn = ttk.Button(frm, text=self._t("admin_mode"), command=self.toggle_admin_mode)
             self.admin_btn.grid(row=0, column=6, padx=6)
@@ -656,8 +663,8 @@ class App:
         self.stream_menu.add_command(label='粘贴到输入框', command=self._paste_to_input)
         self.stream_menu.add_separator()
         self.stream_menu.add_command(label='补充打印', command=self._reprint_selected)
-        self.stream_menu.add_command(label='拉黑并释放ID', command=self._blacklist_selected)
-        self.stream_menu.add_command(label='仅释放永久ID', command=self._release_selected)
+        self.stream_menu.add_command(label='拉黑并停用客户（编号保留）', command=self._blacklist_selected)
+        self.stream_menu.add_command(label='停用客户（编号保留）', command=self._release_selected)
         self.stream_menu.add_command(label='清空弹幕流水', command=self.clear_stream_rows)
         def stream_right_click(event):
             try:
@@ -769,11 +776,13 @@ class App:
         ttk.Label(status_frm, textvariable=self.soft_status_var, anchor=tk.W).pack(fill=tk.X)
 
         # Internal
-        self.queue = queue.Queue()
-        self.reconnect_print_window_seconds = int(self.settings.get("reconnect_print_window_seconds", 20))
+        self.queue = queue.Queue(maxsize=COMMENT_QUEUE_MAXSIZE)
+        self.poll_retry_queue = deque()
+        self.poll_retry_event_ids = set()
         self.print_batch_window_seconds = int(self.settings.get("print_batch_window_seconds", 5))
         self.print_batch_limit = int(self.settings.get("print_batch_limit", 200))
-        self.print_worker_count = int(self.settings.get("print_worker_count", 50))
+        # One consumer preserves the exact database/queue order for a physical printer.
+        self.print_worker_count = 1
         self.print_retry_limit = int(self.settings.get("print_retry_limit", 3))
         self.auto_wrap_print_enabled = bool(self.settings.get("auto_wrap_print_enabled", True))
         self.auto_wrap_name_width = int(self.settings.get("auto_wrap_name_width", 14))
@@ -830,10 +839,8 @@ class App:
         self.fail_alert_threshold = int(self.settings.get("fail_alert_threshold", 20))
         self.peak_warn_threshold = int(self.settings.get("peak_warn_threshold", max(120, self.queue_alert_threshold)))
         self.peak_critical_threshold = int(self.settings.get("peak_critical_threshold", max(self.peak_warn_threshold + 80, self.queue_alert_threshold + 120)))
-        self.peak_duplicate_window_seconds = int(self.settings.get("peak_duplicate_window_seconds", 8))
         self.peak_mode = "normal"
         self.peak_drop_counter = 0
-        self.peak_merge_counter = 0
         self._last_peak_eval_ts = 0.0
         self._last_peak_pending = 0
         self.blacklist_keywords = [x.strip() for x in str(self.settings.get("blacklist_keywords", "")).split(",") if x.strip()]
@@ -853,7 +860,6 @@ class App:
         else:
             self.admin_password_hash = security_utils.hash_password("8888")
         self.user_msg_timestamps = defaultdict(deque)
-        self.recent_print_keys = {}
         self._pid_users_cache = []
         self._pid_cache_ts = 0.0
         self._sign_rate_limited_until = {}
@@ -905,11 +911,16 @@ class App:
         self._feishu_thread.start()
         self.listener_workers = {}
         self.analysis_listener_workers = {}
+        self.browser_session = None
+        self._browser_session_lock = threading.Lock()
         self.printer_locks = defaultdict(lambda: threading.Semaphore(max(1, self.per_printer_limit)))
         # User cache to avoid repeated DB queries
         self.user_cache = {}  # {unique_id: (permanent_id, name)}
-        # Printing core: dispatcher claims time-window batches, workers print concurrently.
-        self.print_task_queue = queue.Queue()
+        # Recover database state before any dispatcher can claim work.
+        db.init_db()
+        # Printing core: keep only a small claimed window ahead of the physical printer.
+        print_prefetch = max(1, min(PRINT_PREFETCH_MAX, self.print_batch_limit))
+        self.print_task_queue = queue.Queue(maxsize=print_prefetch)
         self.print_dispatch_thread = threading.Thread(target=self._print_dispatcher, daemon=True)
         self.print_dispatch_thread.start()
         self.print_workers = []
@@ -924,7 +935,6 @@ class App:
         self.client = None
         self.listen_thread = None
         self.listening = False
-        db.init_db()
         self._setup_input_shortcuts()
         self.custom_name_var.trace_add("write", lambda *_: self._request_save_settings())
         self.room_url_var.trace_add("write", lambda *_: self._request_save_settings())
@@ -1069,6 +1079,8 @@ class App:
             _run()
 
     def _save_settings(self):
+        if getattr(self, "_settings_restore_pending_restart", False):
+            return
         self.settings["settings_version"] = APP_SETTINGS_VERSION
         try:
             self.settings["main_window_geometry"] = str(self.root.winfo_geometry())
@@ -1077,7 +1089,7 @@ class App:
         self.settings["custom_name"] = self.custom_name_var.get().strip() or "主播"
         self.settings["ui_language"] = "zh"
         self.settings["room_url"] = self.room_url_var.get().strip()
-        self.settings["listen_source_mode"] = ("local" if APP_IS_PUBLIC_BUILD else ("relay" if APP_IS_SIGNPOOL_RELAY_BUILD else self._get_listen_source_mode()))
+        self.settings["listen_source_mode"] = "relay" if APP_IS_SIGNPOOL_RELAY_BUILD else self._get_listen_source_mode()
         self.settings["proxy_enabled"] = (False if APP_IS_SIGNPOOL_RELAY_BUILD else bool(self.proxy_enabled.get()))
         self.settings["proxy"] = ("" if APP_IS_SIGNPOOL_RELAY_BUILD else self.proxy_var.get().strip())
         self.settings["proxy_route_mode"] = ("direct" if APP_IS_SIGNPOOL_RELAY_BUILD else self._get_proxy_route_mode())
@@ -1129,7 +1141,6 @@ class App:
         self.settings["editor_paragraph_spacing"] = int(self.editor_paragraph_spacing_var.get()) if hasattr(self, "editor_paragraph_spacing_var") else 0
         self.settings["editor_font_family"] = str(self.editor_font_family_var.get()).strip() if hasattr(self, "editor_font_family_var") else "TkDefaultFont"
         self.settings["editor_var_font_scale_map"] = self.editor_var_font_scale_map if isinstance(getattr(self, "editor_var_font_scale_map", {}), dict) else {}
-        self.settings["reconnect_print_window_seconds"] = int(self.reconnect_print_window_seconds)
         self.settings["print_batch_window_seconds"] = int(self.print_batch_window_seconds)
         self.settings["print_batch_limit"] = int(self.print_batch_limit)
         self.settings["print_worker_count"] = int(self.print_worker_count)
@@ -1151,7 +1162,6 @@ class App:
         self.settings["fail_alert_threshold"] = int(self.fail_alert_threshold)
         self.settings["peak_warn_threshold"] = int(self.peak_warn_threshold)
         self.settings["peak_critical_threshold"] = int(self.peak_critical_threshold)
-        self.settings["peak_duplicate_window_seconds"] = int(self.peak_duplicate_window_seconds)
         self.settings["blacklist_keywords"] = ",".join(self.blacklist_keywords)
         self.settings["whitelist_keywords"] = ",".join(self.whitelist_keywords)
         self.settings["auto_blacklist_rate_limit"] = int(self.auto_blacklist_rate_limit)
@@ -1462,7 +1472,7 @@ class App:
 <title>Sen Nails 数据看板</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f3f6fb;margin:0;padding:18px;color:#1d2433}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .card{background:#fff;border:1px solid #d6deee;border-radius:10px;padding:12px}
 .num{font-size:28px;font-weight:700}
 h1{margin:0 0 12px 0}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
@@ -1473,6 +1483,7 @@ th,td{border-bottom:1px solid #edf1f8;padding:6px 8px;text-align:left;font-size:
 <h1>Sen Nails 实时看板</h1>
 <div class="grid">
 <div class="card"><div>待打印</div><div class="num" id="pending">0</div></div>
+<div class="card"><div>待人工确认</div><div class="num" id="uncertain">0</div></div>
 <div class="card"><div>打印成功</div><div class="num" id="printed">0</div></div>
 <div class="card"><div>打印失败</div><div class="num" id="failed">0</div></div>
 <div class="card"><div>监听直播间</div><div class="num" id="rooms">0</div></div>
@@ -1489,7 +1500,8 @@ function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt
 function barRow(name,val,max){const w=max?Math.round((val/max)*100):0;return `<div style="margin:6px 0"><div style="display:flex;justify-content:space-between"><span>${esc(name)}</span><b>${val}</b></div><div class="bar"><i style="width:${w}%"></i></div></div>`;}
 async function tick(){
   const r=await fetch('/api/summary',{cache:'no-store'}); const d=await r.json();
-  document.getElementById('pending').textContent=d.print_summary.pending||0;
+  document.getElementById('pending').textContent=(d.print_summary.pending||0)+(d.print_summary.claimed||0);
+  document.getElementById('uncertain').textContent=d.print_summary.uncertain||0;
   document.getElementById('printed').textContent=d.print_summary.printed||0;
   document.getElementById('failed').textContent=d.print_summary.failed||0;
   document.getElementById('rooms').textContent=(d.listening_rooms||[]).length;
@@ -1795,13 +1807,13 @@ tick(); setInterval(tick, 3000);
         return "local"
 
     def _get_listen_source_mode(self) -> str:
-        if APP_IS_PUBLIC_BUILD:
-            return "local"
         if APP_IS_SIGNPOOL_RELAY_BUILD:
             return "relay"
         if hasattr(self, "listen_source_mode_var"):
-            return self._normalize_listen_source_mode(self.listen_source_mode_var.get())
-        return self._normalize_listen_source_mode(self.settings.get("listen_source_mode", "local"))
+            mode = self._normalize_listen_source_mode(self.listen_source_mode_var.get())
+        else:
+            mode = self._normalize_listen_source_mode(self.settings.get("listen_source_mode", "local"))
+        return "local" if APP_IS_PUBLIC_BUILD and mode == "relay" else mode
 
     def _update_license_machine_token(self, payload: dict | None = None):
         token = str((payload or {}).get("machine_token", "") or "").strip()
@@ -1908,7 +1920,7 @@ tick(); setInterval(tick, 3000);
             web_state = f"开:{int(getattr(self, 'dashboard_port', 8787))}" if getattr(self, "_dashboard_httpd", None) is not None else "关"
             feishu_state = "开" if bool(getattr(self, "feishu_enabled", False)) else "关"
             self.soft_status_var.set(
-                f"软件状态: {mode} | 主房间:{listeners} | 分析房间:{analysis_listeners} | 弹幕行:{row_cnt} | 队列:{self.queue.qsize()} | 高峰:{peak_mode} 丢弃:{int(getattr(self,'peak_drop_counter',0))} 合并:{int(getattr(self,'peak_merge_counter',0))} | 云:{cloud_state} | 飞书:{feishu_state} | Web:{web_state} | 内存:{mem_txt}"
+                f"软件状态: {mode} | 主房间:{listeners} | 分析房间:{analysis_listeners} | 弹幕行:{row_cnt} | 队列:{self.queue.qsize()} | 高峰:{peak_mode} 丢弃:{int(getattr(self,'peak_drop_counter',0))} | 云:{cloud_state} | 飞书:{feishu_state} | Web:{web_state} | 内存:{mem_txt}"
             )
         except Exception:
             pass
@@ -2625,7 +2637,7 @@ tick(); setInterval(tick, 3000);
 
     def _health_check(self):
         try:
-            pending = len(db.list_print_jobs("pending"))
+            pending = db.count_print_jobs("pending")
             recent_failed = db.get_recent_failed_count(60)
             overlap_cross = len(self._build_overlap_message_report(hours=1).get("cross_stats", []))
             now_ts = time.time()
@@ -2650,14 +2662,25 @@ tick(); setInterval(tick, 3000);
         )
         if not path:
             return
+        db_snapshot = os.path.join(RUNTIME_DIR, f"backup_data_{uuid.uuid4().hex}.db")
         try:
+            db.backup_to(db_snapshot)
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in ("data.db", APP_SETTINGS_FILE, "requirements-lock.txt"):
-                    if os.path.exists(p):
-                        zf.write(p, arcname=p)
+                zf.write(db_snapshot, arcname="data.db")
+                settings_path = self._settings_path()
+                if os.path.exists(settings_path):
+                    zf.write(settings_path, arcname=APP_SETTINGS_FILE)
+                lock_path = os.path.join(os.getcwd(), "requirements-lock.txt")
+                if os.path.exists(lock_path):
+                    zf.write(lock_path, arcname="requirements-lock.txt")
             messagebox.showinfo("备份", f"备份完成: {path}")
         except Exception as e:
             messagebox.showerror("错误", str(e))
+        finally:
+            try:
+                os.remove(db_snapshot)
+            except OSError:
+                pass
 
     def restore_project_state(self):
         if not self._require_admin():
@@ -2667,16 +2690,75 @@ tick(); setInterval(tick, 3000);
             return
         if not messagebox.askyesno("确认", "恢复会覆盖当前 data.db 与设置，是否继续？"):
             return
+        db_snapshot = os.path.join(RUNTIME_DIR, f"restore_data_{uuid.uuid4().hex}.db")
+        settings_snapshot = os.path.join(RUNTIME_DIR, f"restore_settings_{uuid.uuid4().hex}.json")
         try:
             with zipfile.ZipFile(path, "r") as zf:
-                for name in ("data.db", APP_SETTINGS_FILE):
-                    if name in zf.namelist():
-                        zf.extract(name, ".")
-            messagebox.showinfo("恢复", "恢复完成，建议重启程序。")
+                if "data.db" not in zf.namelist():
+                    raise ValueError("备份文件缺少 data.db")
+                with zf.open("data.db") as src, open(db_snapshot, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                if APP_SETTINGS_FILE in zf.namelist():
+                    with zf.open(APP_SETTINGS_FILE) as src, open(settings_snapshot, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+            db.restore_from(db_snapshot)
+            db.init_db()
+            if os.path.exists(settings_snapshot):
+                os.replace(settings_snapshot, self._settings_path())
+                self._settings_restore_pending_restart = True
+            self.user_cache.clear()
+            messagebox.showinfo("恢复", "恢复完成。请关闭并重新打开程序，恢复期间不会再覆盖设置。")
         except Exception as e:
             messagebox.showerror("错误", str(e))
+        finally:
+            for temp_path in (db_snapshot, settings_snapshot):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
-    def _start_listener_for_uid(self, unique_id: str, worker_map=None, group_stop_event=None, source_tag: str = "main", enable_print: bool = True):
+    def _get_browser_session(self):
+        with self._browser_session_lock:
+            if self.browser_session is None:
+                profile_dir = os.path.join(RUNTIME_DIR, "tiktok_browser_profile")
+                self.browser_session = browser_session.BrowserSessionManager(profile_dir)
+            return self.browser_session
+
+    def _close_browser_session(self):
+        with self._browser_session_lock:
+            session = self.browser_session
+            self.browser_session = None
+        if session is not None:
+            session.stop()
+
+    def open_live_browser(self):
+        unique_ids = self._parse_room_inputs(self.room_url_var.get())
+        if not unique_ids:
+            messagebox.showwarning("错误", "请输入有效的 TikTok 直播间网址或主播 ID")
+            return
+        proxy_mode = self._get_proxy_route_mode()
+        proxy = self._resolve_configured_proxy() if self._proxy_applies_to_tiktok(proxy_mode) else ""
+        self._set_status("正在打开直播间浏览器...")
+
+        def worker():
+            try:
+                session = self._get_browser_session()
+                warnings = []
+                for uid in unique_ids:
+                    state = session.open_room(uid, proxy_server=proxy)
+                    if state.warning:
+                        warnings.append(f"@{uid}: {state.warning}")
+                status = f"浏览器已打开 {len(unique_ids)} 个直播间"
+                if warnings:
+                    status += " | " + "；".join(warnings)
+                self.root.after(0, lambda: self._set_status(status))
+            except Exception as exc:
+                self.root.after(0, lambda err=str(exc): messagebox.showerror("浏览器启动失败", err))
+                self.root.after(0, lambda err=str(exc): self._set_status(f"浏览器启动失败: {err}"))
+
+        threading.Thread(target=worker, name="open-live-browser", daemon=True).start()
+
+    def _start_listener_for_uid(self, unique_id: str, worker_map=None, group_stop_event=None, source_tag: str = "main", enable_print: bool = True, browser_mode: bool = False):
         workers = worker_map if isinstance(worker_map, dict) else self.listener_workers
         stop_group = group_stop_event if group_stop_event is not None else self._stop_event
         if unique_id in workers:
@@ -2718,6 +2800,19 @@ tick(); setInterval(tick, 3000);
             max_backoff = 90.0 if has_sign_key else 60.0
             connect_attempt = 0
             last_connect_started = 0.0
+            browser = None
+            if browser_mode:
+                try:
+                    browser = self._get_browser_session()
+                    state = browser.open_room(unique_id, proxy_server=(proxy if use_tiktok_proxy else ""))
+                    status = f"{unique_id} 浏览器会话已就绪"
+                    if state.warning:
+                        status += f" | {state.warning}"
+                    self.queue.put((None, None, status, datetime.now().isoformat(), False, unique_id, source_tag))
+                except Exception as exc:
+                    self.queue.put((None, None, f"Error: 浏览器会话启动失败[{unique_id}]: {exc}", datetime.now().isoformat(), False, unique_id, source_tag))
+                    _schedule_stop(f"浏览器会话启动失败: @{unique_id}")
+                    return
             while not stop_evt.is_set() and not stop_group.is_set():
                 try:
                     # Stability-first pacing: avoid high-frequency reconnect bursts.
@@ -2737,6 +2832,12 @@ tick(); setInterval(tick, 3000);
                         }
                     self._configure_sign_server_defaults(sign_api_base, sign_api_key if has_sign_key else None)
                     httpx_kwargs = {"trust_env": False}
+                    if browser is not None:
+                        browser_state = browser.get_auth_state()
+                        if browser_state.cookies:
+                            httpx_kwargs["cookies"] = browser_state.cookies
+                        if browser_state.user_agent:
+                            httpx_kwargs["headers"] = {"User-Agent": browser_state.user_agent}
                     if ssl_verify_disabled:
                         httpx_kwargs["verify"] = False
                         ws_kwargs["ssl"] = ssl._create_unverified_context()
@@ -2760,15 +2861,21 @@ tick(); setInterval(tick, 3000);
                     @client.on(CommentEvent)
                     def on_comment(event):
                         unique = getattr(event, 'user_info', None)
-                        uid = getattr(unique, 'username', None) or getattr(unique, 'sec_uid', None) or str(getattr(unique, 'id', ''))
+                        platform_user_id = str(getattr(unique, 'id', '') or getattr(unique, 'sec_uid', '') or '').strip()
+                        uid = getattr(unique, 'username', None) or platform_user_id
                         name = getattr(unique, 'nick_name', None) or getattr(unique, 'username', None) or ''
                         content = getattr(event, 'content', '')
-                        timestamp = datetime.now().isoformat(sep=' ', timespec='seconds')
+                        base_message = getattr(event, 'base_message', None)
+                        platform_event_id = str(getattr(base_message, 'message_id', '') or '').strip()
+                        event_ts = int(getattr(base_message, 'create_time', 0) or 0)
+                        if event_ts > 10_000_000_000:
+                            event_ts //= 1000
+                        timestamp = datetime.fromtimestamp(event_ts).isoformat(sep=' ', timespec='seconds') if event_ts > 0 else datetime.now().isoformat(sep=' ', timespec='seconds')
                         # Important: do not permanently suppress printing after reconnect.
                         # Reconnect window is kept for telemetry/compatibility only.
                         allow_auto_print = bool(enable_print)
                         # source_room uses current listener uid for overlap analysis
-                        self.queue.put((uid, name, content, timestamp, allow_auto_print, unique_id, source_tag))
+                        self.queue.put((uid, name, content, timestamp, allow_auto_print, unique_id, source_tag, platform_event_id, platform_user_id))
 
                     if LiveEndEvent is not None:
                         @client.on(LiveEndEvent)
@@ -2838,14 +2945,7 @@ tick(); setInterval(tick, 3000);
                             pass
                         break
                     if (not ssl_verify_disabled) and ("ssl" in err_lower) and ("certificate" in err_lower):
-                        httpx_kwargs = dict(web_kwargs.get('httpx_kwargs', {}))
-                        httpx_kwargs['verify'] = False
-                        web_kwargs['httpx_kwargs'] = httpx_kwargs
-                        ws_kwargs['ssl'] = ssl._create_unverified_context()
-                        ssl_verify_disabled = True
-                        self.queue.put((None, None, f"{unique_id} SSL证书失败，已切不校验重连", datetime.now().isoformat(), False, unique_id, source_tag))
-                        time.sleep(0.5)
-                        continue
+                        self.queue.put((None, None, f"{unique_id} SSL证书校验失败；如使用抓包代理，请在确认代理可信后手动启用“不校验证书”", datetime.now().isoformat(), False, unique_id, source_tag))
                     if "socksio" in err_lower or "unknown scheme for proxy url" in err_lower:
                         self.queue.put((None, None, "代理错误: 你的环境缺少 SOCKS 支持，请安装 `pip install socksio`，或改用 http://127.0.0.1:7890", datetime.now().isoformat(), False, unique_id, source_tag))
                     if sign_error and has_sign_key:
@@ -2870,6 +2970,11 @@ tick(); setInterval(tick, 3000);
                 finally:
                     if not stop_evt.is_set() and not stop_group.is_set():
                         time.sleep(0.5)
+            if browser is not None:
+                try:
+                    browser.close_room(unique_id)
+                except Exception:
+                    pass
 
         th = threading.Thread(target=target, daemon=True)
         workers[unique_id] = {"stop": stop_evt, "thread": th, "holder": holder}
@@ -2988,6 +3093,8 @@ tick(); setInterval(tick, 3000);
                             True,
                             unique_id,
                             source_tag,
+                            str(item.get("event_id", "") or ""),
+                            str(item.get("platform_user_id", "") or item.get("user_id", "") or ""),
                         ))
                     elif event_type == "live_end":
                         self.queue.put((None, None, f"__LIVE_END__::{unique_id}", event_time, False, unique_id, source_tag))
@@ -3073,6 +3180,10 @@ tick(); setInterval(tick, 3000);
             except Exception:
                 pass
         self.listener_workers.clear()
+        try:
+            self._close_browser_session()
+        except Exception:
+            pass
         self._set_status("已停止")
 
     def stop_analysis_listen(self):
@@ -3106,12 +3217,10 @@ tick(); setInterval(tick, 3000);
         kw_list_var = tk.StringVar(value=",".join(self.keyword_print_list))
         min_len_var = tk.IntVar(value=self.print_min_len)
         max_len_var = tk.IntVar(value=self.print_max_len)
-        reconnect_var = tk.IntVar(value=self.reconnect_print_window_seconds)
         lock_mode_var = tk.IntVar(value=1 if self.lock_order_mode else 0)
         lock_window_var = tk.IntVar(value=self.lock_order_window_seconds)
         max_rows_var = tk.IntVar(value=self.max_stream_rows)
         archive_var = tk.IntVar(value=1 if self.auto_archive_stream else 0)
-        worker_var = tk.IntVar(value=self.print_worker_count)
         retry_var = tk.IntVar(value=self.print_retry_limit)
         wrap_enable_var = tk.IntVar(value=1 if self.auto_wrap_print_enabled else 0)
         wrap_name_var = tk.IntVar(value=self.auto_wrap_name_width)
@@ -3121,14 +3230,13 @@ tick(); setInterval(tick, 3000);
         fail_alert_var = tk.IntVar(value=self.fail_alert_threshold)
         peak_warn_var = tk.IntVar(value=self.peak_warn_threshold)
         peak_critical_var = tk.IntVar(value=self.peak_critical_threshold)
-        peak_dup_win_var = tk.IntVar(value=self.peak_duplicate_window_seconds)
         black_kw_var = tk.StringVar(value=",".join(self.blacklist_keywords))
         white_kw_var = tk.StringVar(value=",".join(self.whitelist_keywords))
         rate_limit_var = tk.IntVar(value=self.auto_blacklist_rate_limit)
         admin_pwd_var = tk.StringVar(value="")
 
         r = 0
-        ttk.Checkbutton(frm, text="纯数字自动打印", variable=auto_num_var).grid(row=r, column=0, sticky=tk.W); r += 1
+        ttk.Checkbutton(frm, text="纯数字及数字英文自动打印", variable=auto_num_var).grid(row=r, column=0, sticky=tk.W); r += 1
         ttk.Checkbutton(frm, text="启用关键词打印", variable=kw_enable_var).grid(row=r, column=0, sticky=tk.W); r += 1
         ttk.Label(frm, text="关键词(逗号分隔):").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=kw_list_var, width=48).grid(row=r, column=1, sticky=tk.W); r += 1
@@ -3136,16 +3244,14 @@ tick(); setInterval(tick, 3000);
         ttk.Entry(frm, textvariable=min_len_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="打印最大长度:").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=max_len_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
-        ttk.Label(frm, text="重连后自动打印时长(秒):").grid(row=r, column=0, sticky=tk.W)
-        ttk.Entry(frm, textvariable=reconnect_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Checkbutton(frm, text="抢单锁单模式", variable=lock_mode_var).grid(row=r, column=0, sticky=tk.W); r += 1
         ttk.Label(frm, text="锁单窗口(秒):").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=lock_window_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="弹幕窗口最大行数:").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=max_rows_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Checkbutton(frm, text="超出行数自动归档", variable=archive_var).grid(row=r, column=0, sticky=tk.W); r += 1
-        ttk.Label(frm, text="并发打印线程数:").grid(row=r, column=0, sticky=tk.W)
-        ttk.Entry(frm, textvariable=worker_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
+        ttk.Label(frm, text="打印顺序:").grid(row=r, column=0, sticky=tk.W)
+        ttk.Label(frm, text="单线程严格 FIFO").grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="打印失败重试次数:").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=retry_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Checkbutton(frm, text="打印自动分段换行", variable=wrap_enable_var).grid(row=r, column=0, sticky=tk.W); r += 1
@@ -3163,8 +3269,6 @@ tick(); setInterval(tick, 3000);
         ttk.Entry(frm, textvariable=peak_warn_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="高峰降级阈值(pending):").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=peak_critical_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
-        ttk.Label(frm, text="高峰合并窗口(秒):").grid(row=r, column=0, sticky=tk.W)
-        ttk.Entry(frm, textvariable=peak_dup_win_var, width=8).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="自动拉黑关键词(逗号):").grid(row=r, column=0, sticky=tk.W)
         ttk.Entry(frm, textvariable=black_kw_var, width=48).grid(row=r, column=1, sticky=tk.W); r += 1
         ttk.Label(frm, text="白名单关键词(逗号):").grid(row=r, column=0, sticky=tk.W)
@@ -3180,12 +3284,10 @@ tick(); setInterval(tick, 3000);
             self.keyword_print_list = [x.strip() for x in kw_list_var.get().split(",") if x.strip()]
             self.print_min_len = max(1, int(min_len_var.get()))
             self.print_max_len = max(self.print_min_len, int(max_len_var.get()))
-            self.reconnect_print_window_seconds = max(0, int(reconnect_var.get()))
             self.lock_order_mode = bool(lock_mode_var.get())
             self.lock_order_window_seconds = max(1, int(lock_window_var.get()))
             self.max_stream_rows = max(100, int(max_rows_var.get()))
             self.auto_archive_stream = bool(archive_var.get())
-            self.print_worker_count = max(1, int(worker_var.get()))
             self.print_retry_limit = max(1, int(retry_var.get()))
             self.auto_wrap_print_enabled = bool(wrap_enable_var.get())
             self.auto_wrap_name_width = max(4, int(wrap_name_var.get()))
@@ -3198,7 +3300,6 @@ tick(); setInterval(tick, 3000);
             self.fail_alert_threshold = max(1, int(fail_alert_var.get()))
             self.peak_warn_threshold = max(1, int(peak_warn_var.get()))
             self.peak_critical_threshold = max(self.peak_warn_threshold + 1, int(peak_critical_var.get()))
-            self.peak_duplicate_window_seconds = max(1, int(peak_dup_win_var.get()))
             self.blacklist_keywords = [x.strip() for x in black_kw_var.get().split(",") if x.strip()]
             self.whitelist_keywords = [x.strip() for x in white_kw_var.get().split(",") if x.strip()]
             self.auto_blacklist_rate_limit = max(0, int(rate_limit_var.get()))
@@ -3209,7 +3310,7 @@ tick(); setInterval(tick, 3000);
                     return
                 self.admin_password_hash = security_utils.hash_password(new_admin_password)
             self._save_settings()
-            messagebox.showinfo("规则中心", "规则已保存\n注: 并发线程数修改在重启后生效")
+            messagebox.showinfo("规则中心", "规则已保存")
             win.destroy()
 
         btn = ttk.Frame(frm); btn.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=10)
@@ -3248,7 +3349,9 @@ tick(); setInterval(tick, 3000);
             f"今日客人数: {guest_count}",
             f"今日弹幕总数: {total_msgs}",
             f"打印队列 pending: {summary['pending']}",
+            f"打印队列 claimed: {summary['claimed']}",
             f"打印队列 processing: {summary['processing']}",
+            f"待人工确认 uncertain: {summary['uncertain']}",
             f"打印成功 printed: {summary['printed']}",
             f"打印失败 failed: {summary['failed']}",
             "",
@@ -3280,10 +3383,11 @@ tick(); setInterval(tick, 3000);
             try:
                 if path.lower().endswith(".csv"):
                     with open(path, "w", encoding="utf-8") as f:
-                        f.write("date,guest_count,total_messages,pending,processing,printed,failed\n")
+                        f.write("date,guest_count,total_messages,pending,claimed,processing,uncertain,printed,failed\n")
                         f.write(
                             f"{self.today_date},{guest_count},{total_msgs},"
-                            f"{summary['pending']},{summary['processing']},{summary['printed']},{summary['failed']}\n"
+                            f"{summary['pending']},{summary['claimed']},{summary['processing']},{summary['uncertain']},"
+                            f"{summary['printed']},{summary['failed']}\n"
                         )
                         f.write("\nfail_reason,count\n")
                         for reason, count in reasons:
@@ -5887,7 +5991,7 @@ tick(); setInterval(tick, 3000);
             checks.append(("代理", self._proxy_route_mode_label(self._get_proxy_route_mode())))
             checks.append(("SSL校验", "关闭(稳定优先)" if self.ssl_insecure_var.get() else "开启"))
             checks.append(("监听房间", str(len(self.listener_workers))))
-            checks.append(("打印队列pending", str(len(db.list_print_jobs("pending")))))
+            checks.append(("打印队列pending", str(db.count_print_jobs("pending"))))
             checks.append(("最近60秒失败", str(db.get_recent_failed_count(60))))
             rec_dir = self.auto_record_dir if self.auto_record_dir else os.path.join(os.getcwd(), "recordings")
             free_mb = "-"
@@ -5971,7 +6075,7 @@ tick(); setInterval(tick, 3000);
                 recorders = len(self.record_workers)
                 q = self.queue.qsize()
                 rows = len(self.stream_tree.get_children())
-                pending = len(db.list_print_jobs("pending"))
+                pending = db.count_print_jobs("pending")
                 failed60 = db.get_recent_failed_count(60)
                 lines = [
                     f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -6049,6 +6153,13 @@ tick(); setInterval(tick, 3000);
                 printer = ""
         return str(printer or "").strip()
 
+    def _snapshot_print_job_settings(self) -> tuple[str, str]:
+        width_mm, height_mm = self._get_current_paper_size_mm()
+        return (
+            self._resolve_active_printer(),
+            printer_utils.format_paper_size_mm(width_mm, height_mm),
+        )
+
     def _build_calibration_sheet_text(self, round_no: int) -> str:
         sample_30 = "123456789012345678901234567890"
         lines = [
@@ -6079,11 +6190,7 @@ tick(); setInterval(tick, 3000);
         printer = self._resolve_active_printer()
         if not printer:
             return False, "未找到可用打印机", ""
-        try:
-            width_mm = int(float(self.width_var.get().strip()))
-            height_mm = int(float(self.height_var.get().strip()))
-        except Exception:
-            width_mm, height_mm = 40, 30
+        width_mm, height_mm = self._get_current_paper_size_mm()
         os.makedirs(DATA_DIR, exist_ok=True)
         path = os.path.join(DATA_DIR, f"calibration_round_{int(round_no)}_{int(time.time())}.txt")
         text = self._build_calibration_sheet_text(round_no)
@@ -7447,14 +7554,20 @@ tick(); setInterval(tick, 3000);
                 h = max(12, int(round(int(e.get("h", 34)) * scale_y)))
                 inset_x = max(2, int(round(4 * base_scale)))
                 inset_y = max(2, int(round(3 * base_scale)))
-                font_px = max(DESIGNER_MIN_FONT_SIZE, int(round(_elem_font_size(e) * base_scale)))
+                font_height_px = max(
+                    DESIGNER_MIN_FONT_SIZE,
+                    int(round(_elem_font_size(e) * 25.4 * px_per_mm / 72.0)),
+                )
                 font_obj = _get_cached_font(
                     _elem_font_family(e),
-                    font_px,
+                    -font_height_px,
                     "bold" if int(e.get("bold", 0)) else "normal",
                 )
                 box_width = max(8, w - (inset_x * 2))
-                line_height_px = max(font_obj.metrics("linespace"), font_px + max(2, int(round(base_scale * 2))))
+                line_height_px = max(
+                    font_obj.metrics("linespace"),
+                    font_height_px + max(2, int(round(base_scale * 2))),
+                )
                 wrapped_lines = _wrap_preview_text(
                     text,
                     font_obj,
@@ -8948,11 +9061,7 @@ tick(); setInterval(tick, 3000);
             os.makedirs(DATA_DIR, exist_ok=True)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             path = os.path.join(DATA_DIR, f"test_print_{int(time.time())}.txt")
-            try:
-                width_mm = int(float(self.width_var.get().strip()))
-                height_mm = int(float(self.height_var.get().strip()))
-            except Exception:
-                width_mm, height_mm = 40, 30
+            width_mm, height_mm = self._get_current_paper_size_mm()
             char_width_mm, line_height_mm, margin_mm = self._print_calibration()
             body = (
                 "Sen Nails 打印测试\n"
@@ -9138,9 +9247,9 @@ tick(); setInterval(tick, 3000);
         btn_frm = ttk.Frame(win)
         btn_frm.pack(fill=tk.X)
         ttk.Button(btn_frm, text='刷新', command=lambda: self._refresh_pid_tree(tree)).pack(side=tk.LEFT)
-        ttk.Button(btn_frm, text='删除并拉黑', command=lambda: self._pid_delete_and_blacklist(tree)).pack(side=tk.LEFT)
-        ttk.Button(btn_frm, text='删除并释放ID', command=lambda: self._pid_delete_release(tree)).pack(side=tk.LEFT)
-        ttk.Button(btn_frm, text='全部删除', command=lambda: self._pid_delete_all(tree)).pack(side=tk.LEFT)
+        ttk.Button(btn_frm, text='拉黑并停用', command=lambda: self._pid_delete_and_blacklist(tree)).pack(side=tk.LEFT)
+        ttk.Button(btn_frm, text='停用客户（编号保留）', command=lambda: self._pid_delete_release(tree)).pack(side=tk.LEFT)
+        ttk.Button(btn_frm, text='全部停用', command=lambda: self._pid_delete_all(tree)).pack(side=tk.LEFT)
         
         # context menu for copying
         pid_menu = tk.Menu(win, tearoff=0)
@@ -9264,10 +9373,10 @@ tick(); setInterval(tick, 3000);
                     timestamp = datetime.now().isoformat(sep=' ', timespec='seconds')
                 rendered = self._compose_print_rendered(permanent_id, unique_id, display_name, timestamp, content)
                 try:
-                    size_str = f"{self.width_var.get().strip()}x{self.height_var.get().strip()}"
+                    job_printer, size_str = self._snapshot_print_job_settings()
                     trace_id = self._new_trace_id()
                     jid = db.add_print_job(
-                        permanent_id, unique_id, display_name, timestamp, content, rendered, ("" if bool(self.use_default_printer_var.get()) else self.printer_cb.get()), size_str,
+                        permanent_id, unique_id, display_name, timestamp, content, rendered, job_printer, size_str,
                         raw_message=content, rule_hit="manual_paste", trace_id=trace_id,
                     )
                     messagebox.showinfo('成功', f'已加入打印队列 (JID:{jid}, Trace:{trace_id})')
@@ -9305,10 +9414,10 @@ tick(); setInterval(tick, 3000);
                 message = str(message)[2:]
             rendered = self._compose_print_rendered(permanent_id, unique_id, display_name, timestamp, message)
             try:
-                size_str = f"{self.width_var.get().strip()}x{self.height_var.get().strip()}"
+                job_printer, size_str = self._snapshot_print_job_settings()
                 trace_id = self._new_trace_id()
                 last_jid = db.add_print_job(
-                    permanent_id, unique_id, display_name, timestamp, message, rendered, ("" if bool(self.use_default_printer_var.get()) else self.printer_cb.get()), size_str,
+                    permanent_id, unique_id, display_name, timestamp, message, rendered, job_printer, size_str,
                     raw_message=message, rule_hit="manual_reprint", trace_id=trace_id,
                 )
                 success += 1
@@ -9367,12 +9476,12 @@ tick(); setInterval(tick, 3000);
                 self.user_msg_timestamps.pop(unique_id, None)
             except Exception:
                 pass
-        self._set_status(f"已拉黑并释放: 用户{blacklisted}，释放ID{released}")
+        self._set_status(f"已拉黑并停用: 用户{blacklisted}，永久编号保留{released}个")
         self._sync_local_permanent_ids_backup("blacklist_release")
         _sync_ok, sync_msg = self._sync_deleted_permanent_ids_to_server()
         if sync_msg:
             self._set_status(str(sync_msg))
-        msg = f'已拉黑 {blacklisted} 个用户，释放永久ID {released} 个'
+        msg = f'已拉黑 {blacklisted} 个用户，停用 {released} 个客户；永久编号均保留'
         if sync_msg:
             msg += f'\n\n服务器同步: {sync_msg}'
         messagebox.showinfo('完成', msg)
@@ -9384,7 +9493,7 @@ tick(); setInterval(tick, 3000);
         if not unique_ids:
             messagebox.showwarning('警告', '请先选择有效的客户ID')
             return
-        if not messagebox.askyesno('确认', f'确认仅释放 {len(unique_ids)} 个用户的永久ID（不拉黑）?'):
+        if not messagebox.askyesno('确认', f'确认停用 {len(unique_ids)} 个客户（不拉黑，永久编号保留）?'):
             return
         released = 0
         for unique_id in unique_ids:
@@ -9395,12 +9504,12 @@ tick(); setInterval(tick, 3000);
                 self.user_cache.pop(unique_id, None)
             except Exception:
                 pass
-        self._set_status(f"已释放永久ID: {released}")
+        self._set_status(f"已停用客户: {released}（永久编号保留）")
         self._sync_local_permanent_ids_backup("release_only")
         _sync_ok, sync_msg = self._sync_deleted_permanent_ids_to_server()
         if sync_msg:
             self._set_status(str(sync_msg))
-        msg = f'已释放永久ID {released} 个（未拉黑）'
+        msg = f'已停用 {released} 个客户（未拉黑，永久编号保留）'
         if sync_msg:
             msg += f'\n\n服务器同步: {sync_msg}'
         messagebox.showinfo('完成', msg)
@@ -9530,7 +9639,7 @@ tick(); setInterval(tick, 3000);
         self._last_peak_eval_ts = now_ts
         pending = 0
         try:
-            pending = len(db.list_print_jobs("pending"))
+            pending = db.count_print_jobs("pending")
         except Exception:
             pending = int(getattr(self, "_last_peak_pending", 0))
         self._last_peak_pending = int(pending)
@@ -9541,81 +9650,36 @@ tick(); setInterval(tick, 3000);
         else:
             self.peak_mode = "normal"
 
-    def _apply_peak_protection(self, unique_id: str, content: str, should_print: bool, rule_hit: str) -> tuple[bool, str]:
+    def _apply_peak_protection(self, should_print: bool, rule_hit: str) -> tuple[bool, str]:
         """Return (should_print, tag). tag used for UI visibility."""
         if not should_print:
             return False, ""
         mode = str(getattr(self, "peak_mode", "normal"))
         if mode == "normal":
             return True, ""
-        # warn: de-dup frequent repeats in short window
         if mode == "warn":
-            try:
-                win = max(1, int(self.peak_duplicate_window_seconds))
-                if db.has_recent_job_duplicate(unique_id, content, win):
-                    self.peak_merge_counter += 1
-                    return False, "高峰合并"
-            except Exception:
-                pass
             return True, "高峰警戒"
         # critical: only keep high-priority prints (numeric / keyword), drop low-priority jobs
         if mode == "critical":
             hit = str(rule_hit or "")
-            if not (hit == "numeric" or hit.startswith("keyword:")):
+            if not (hit in ("numeric", "alphanumeric") or hit.startswith("keyword:")):
                 self.peak_drop_counter += 1
                 return False, "高峰降级丢弃"
             return True, "高峰关键优先"
         return should_print, ""
 
-    def _dedupe_print_in_reconnect_window(self, unique_id: str, content: str, now_ts: float) -> bool:
-        """True means skip printing duplicate message in reconnect window."""
-        try:
-            win_sec = max(0, int(self.reconnect_print_window_seconds))
-        except Exception:
-            win_sec = 20
-        if win_sec <= 0:
-            return False
-        key = f"{str(unique_id).strip()}|{str(content).strip()}"
-        if not key.strip("|"):
-            return False
-        # Durable dedupe: if same message already exists in recent
-        # pending/processing/printed jobs, skip enqueue/print.
-        try:
-            if db.has_recent_job_duplicate(unique_id, content, win_sec):
-                self.recent_print_keys[key] = float(now_ts)
-                return True
-        except Exception:
-            pass
-        cutoff = float(now_ts) - float(win_sec)
-        try:
-            stale = [k for k, ts in self.recent_print_keys.items() if float(ts) < cutoff]
-            for k in stale:
-                self.recent_print_keys.pop(k, None)
-        except Exception:
-            pass
-        last_ts = self.recent_print_keys.get(key)
-        if last_ts is not None and (float(now_ts) - float(last_ts)) <= float(win_sec):
-            return True
-        self.recent_print_keys[key] = float(now_ts)
-        return False
-
     def _new_trace_id(self) -> str:
         return datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:12]
 
     def _match_print_rule(self, content: str) -> tuple[bool, str]:
-        text = (content or "").strip()
-        if not text:
-            return False, ""
-        if len(text) < self.print_min_len or len(text) > self.print_max_len:
-            return False, ""
-        is_numeric = text.isdigit()
-        if is_numeric and self.auto_print_numeric:
-            return True, "numeric"
-        if self.keyword_print_enabled and self.keyword_print_list:
-            for kw in self.keyword_print_list:
-                if kw and kw in text:
-                    return True, f"keyword:{kw}"
-        return False, ""
+        return comment_rules.classify_print_content(
+            content,
+            numeric_enabled=self.auto_print_numeric,
+            keyword_enabled=self.keyword_print_enabled,
+            keywords=self.keyword_print_list,
+            min_length=self.print_min_len,
+            max_length=self.print_max_len,
+        )
 
     def _add_stream_row(self, when_ts, permanent_id, unique_id, display_name, message_text, guest_msg_count='-', today_guest_rank='-', source_room='-'):
         t = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(when_ts))
@@ -9680,7 +9744,10 @@ tick(); setInterval(tick, 3000);
                 left_min = max(1, int((block_until - time.time()) / 60))
                 self._set_status(f"签名限流冷却中 @{uid}，剩余约 {left_min} 分钟")
                 continue
-            self._start_relay_listener_for_uid(uid) if listen_mode == "relay" else self._start_listener_for_uid(uid)
+            if listen_mode == "relay":
+                self._start_relay_listener_for_uid(uid)
+            else:
+                self._start_listener_for_uid(uid, browser_mode=(listen_mode == "browser"))
             new_count += 1
         active = ", ".join("@"+u for u in self.listener_workers.keys())
         self._set_status(f"监听中: {active}")
@@ -9694,12 +9761,14 @@ tick(); setInterval(tick, 3000);
 
     def _poll(self):
         next_delay_ms = 200
+        batch = []
+        current_index = -1
         try:
             self._refresh_peak_mode()
             # Adaptive batching: process more when backlog grows, but keep one UI slice bounded.
             backlog = 0
             try:
-                backlog = int(self.queue.qsize())
+                backlog = int(self.queue.qsize()) + len(self.poll_retry_queue)
             except Exception:
                 backlog = 0
             target_batch = 10
@@ -9711,17 +9780,19 @@ tick(); setInterval(tick, 3000);
                 target_batch = 30
             target_batch = max(10, min(POLL_MAX_BATCH, int(target_batch)))
             deadline = time.time() + (float(POLL_MAX_SLICE_MS) / 1000.0)
-            batch = []
             for _ in range(target_batch):
-                try:
-                    msg = self.queue.get_nowait()
-                    batch.append(msg)
-                except queue.Empty:
-                    break
+                if self.poll_retry_queue:
+                    msg = self.poll_retry_queue.popleft()
+                else:
+                    try:
+                        msg = self.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                batch.append(msg)
                 if time.time() >= deadline:
                     break
             try:
-                left = int(self.queue.qsize())
+                left = int(self.queue.qsize()) + len(self.poll_retry_queue)
             except Exception:
                 left = 0
             if left > 200:
@@ -9731,8 +9802,19 @@ tick(); setInterval(tick, 3000);
             elif left > 20:
                 next_delay_ms = 120
 
-            for item in batch:
-                if len(item) >= 7:
+            for current_index, item in enumerate(batch):
+                if current_index > 0 and time.time() >= deadline:
+                    for pending_item in reversed(batch[current_index:]):
+                        self.poll_retry_queue.appendleft(pending_item)
+                    next_delay_ms = 30
+                    break
+                platform_event_id = ""
+                platform_user_id = ""
+                if len(item) >= 9:
+                    unique_id, name, content, timestamp, allow_auto_print, source_room, source_tag, platform_event_id, platform_user_id = item
+                elif len(item) >= 8:
+                    unique_id, name, content, timestamp, allow_auto_print, source_room, source_tag, platform_event_id = item
+                elif len(item) >= 7:
                     unique_id, name, content, timestamp, allow_auto_print, source_room, source_tag = item
                 elif len(item) >= 6:
                     unique_id, name, content, timestamp, allow_auto_print, source_room = item
@@ -9764,6 +9846,34 @@ tick(); setInterval(tick, 3000);
                     except Exception:
                         when_ts = time.time()
                     self._add_stream_row(when_ts, '-', '-', '系统', content, '-', '-', source_room)
+                    continue
+
+                unique_id = str(unique_id or "").strip()
+                name = str(name or "")
+                content = str(content or "").strip()
+                if not unique_id:
+                    self._audit("comment_identity_missing", f"room={source_room}|event={platform_event_id}")
+                    continue
+
+                try:
+                    comment_event_id, inserted = db.record_comment_event(
+                        platform_event_id,
+                        source_room,
+                        unique_id,
+                        platform_user_id,
+                        name,
+                        content,
+                        timestamp,
+                        source_tag,
+                    )
+                except Exception as exc:
+                    self._audit("comment_persist_failed", f"room={source_room}|uid={unique_id}|error={exc}")
+                    continue
+                retry_event_key = f"{source_room}|{platform_event_id}" if platform_event_id else ""
+                is_local_retry = bool(retry_event_key and retry_event_key in self.poll_retry_event_ids)
+                if is_local_retry:
+                    self.poll_retry_event_ids.discard(retry_event_key)
+                if platform_event_id and not inserted and not is_local_retry:
                     continue
 
                 guest_msg_count, today_guest_rank = self._next_guest_metrics(unique_id)
@@ -9798,19 +9908,14 @@ tick(); setInterval(tick, 3000);
                     continue
 
                 # detect pure numeric
-                is_numeric = content.isdigit()
+                is_numeric = bool(content and content.isascii() and content.isdigit())
                 rule_match, rule_hit = self._match_print_rule(content)
-                should_print = rule_match and allow_auto_print
-                should_print, lock_tag = self._check_lock_order(unique_id, content, should_print)
-                if should_print and self._dedupe_print_in_reconnect_window(unique_id, content, when_ts):
-                    should_print = False
-                should_print, peak_tag = self._apply_peak_protection(unique_id, content, should_print, rule_hit)
 
                 # Use cache to reduce DB queries.
                 # Only create a permanent ID when needed (numeric flow).
                 if unique_id not in self.user_cache:
                     try:
-                        existing = db.get_user_by_unique_id(unique_id)
+                        existing = db.get_user_by_identity(unique_id, platform_user_id)
                         if existing:
                             permanent_id, stored_name = existing
                             resolved_name = name or stored_name
@@ -9820,7 +9925,7 @@ tick(); setInterval(tick, 3000);
                             if remote_pid:
                                 permanent_id = remote_pid
                             else:
-                                _, permanent_id = db.get_or_create_user(unique_id, name)
+                                _, permanent_id = db.get_or_create_user(unique_id, name, platform_user_id)
                             self.user_cache[unique_id] = (permanent_id, name)
                             self._sync_local_permanent_ids_backup("create_pid")
                         else:
@@ -9841,11 +9946,17 @@ tick(); setInterval(tick, 3000);
                         if remote_pid:
                             permanent_id = remote_pid
                         else:
-                            _, permanent_id = db.get_or_create_user(unique_id, name)
+                            _, permanent_id = db.get_or_create_user(unique_id, name, platform_user_id)
                         self.user_cache[unique_id] = (permanent_id, name)
                         self._sync_local_permanent_ids_backup("create_pid")
                     except Exception:
                         pass
+
+                should_print = rule_match and allow_auto_print
+                if not comment_rules.has_required_permanent_number(rule_hit, permanent_id):
+                    should_print = False
+                should_print, lock_tag = self._check_lock_order(unique_id, content, should_print)
+                should_print, peak_tag = self._apply_peak_protection(should_print, rule_hit)
 
                 # ADD TO STREAM WINDOW
                 try:
@@ -9884,11 +9995,11 @@ tick(); setInterval(tick, 3000);
                         },
                     )
                     try:
-                        size_str = f"{self.width_var.get().strip()}x{self.height_var.get().strip()}"
+                        job_printer, size_str = self._snapshot_print_job_settings()
                         trace_id = self._new_trace_id()
                         jid = db.add_print_job(
-                            permanent_id, unique_id, name, timestamp, content, rendered, ("" if bool(self.use_default_printer_var.get()) else self.printer_cb.get()), size_str,
-                            raw_message=content, rule_hit=rule_hit, trace_id=trace_id,
+                            permanent_id, unique_id, name, timestamp, content, rendered, job_printer, size_str,
+                            raw_message=content, rule_hit=rule_hit, trace_id=trace_id, comment_event_id=comment_event_id,
                         )
                         self._audit("print_job_enqueued", f"jid={jid}|trace={trace_id}|uid={unique_id}|rule={rule_hit}")
                     except Exception:
@@ -9902,8 +10013,20 @@ tick(); setInterval(tick, 3000);
                             printer_utils.print_to_file(rendered_text, path)
                         except Exception:
                             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            retry_from = current_index + 1
+            if current_index >= 0:
+                current_item = batch[current_index]
+                if len(current_item) >= 8 and str(current_item[7] or "").strip():
+                    retry_from = current_index
+                    retry_room = str(current_item[5] or "") if len(current_item) >= 6 else ""
+                    self.poll_retry_event_ids.add(f"{retry_room}|{str(current_item[7]).strip()}")
+            for pending_item in batch[max(0, retry_from):]:
+                self.poll_retry_queue.append(pending_item)
+            self._audit(
+                "poll_batch_failed",
+                f"index={current_index}|retry={max(0, len(batch) - max(0, retry_from))}|error={exc}",
+            )
         finally:
             self.root.after(max(30, int(next_delay_ms)), self._poll)
 
@@ -10088,7 +10211,7 @@ tick(); setInterval(tick, 3000);
         filter_frm.pack(fill=tk.X, padx=6, pady=6)
         ttk.Label(filter_frm, text="状态筛选").pack(side=tk.LEFT)
         status_filter_var = tk.StringVar(value="all")
-        ttk.Combobox(filter_frm, textvariable=status_filter_var, values=["all", "pending", "processing", "printed", "failed"], width=12, state="readonly").pack(side=tk.LEFT, padx=4)
+        ttk.Combobox(filter_frm, textvariable=status_filter_var, values=["all", "pending", "claimed", "processing", "uncertain", "printed", "failed"], width=12, state="readonly").pack(side=tk.LEFT, padx=4)
         ttk.Label(filter_frm, text="关键词").pack(side=tk.LEFT, padx=(8, 2))
         kw_filter_var = tk.StringVar(value="")
         ttk.Entry(filter_frm, textvariable=kw_filter_var, width=24).pack(side=tk.LEFT, padx=2)
@@ -10156,10 +10279,14 @@ tick(); setInterval(tick, 3000);
         if not sel:
             messagebox.showwarning('提示', '请选择任务')
             return
-        jid = tree.item(sel[0], 'values')[0]
-        db.reset_job_to_pending(jid)
+        selected_rows = [tree.item(item, 'values') for item in sel]
+        if any(len(values) > 6 and str(values[6]) == "uncertain" for values in selected_rows):
+            if not messagebox.askyesno('确认补打', '所选任务可能已经出纸，确认仍要重新加入打印队列吗？'):
+                return
+        for values in selected_rows:
+            db.reset_job_to_pending(values[0])
         self._refresh_job_tree(tree)
-        messagebox.showinfo('已重试', f'任务 {jid} 已重置为 pending')
+        messagebox.showinfo('已重试', f'已将 {len(selected_rows)} 个任务重置为 pending')
 
     def _job_delete_selected(self, tree):
         sel = tree.selection()
@@ -10222,7 +10349,7 @@ tick(); setInterval(tick, 3000);
             return
         vals = tree.item(sel[0], 'values')
         pid, unique_id = vals[0], vals[1]
-        confirm = messagebox.askyesno('确认', f'是否删除并拉黑 {unique_id} (ID={pid}) ?')
+        confirm = messagebox.askyesno('确认', f'是否拉黑并停用 {unique_id}？永久编号 ID={pid} 将永久保留。')
         if not confirm:
             return
         db.blacklist_and_remove(unique_id)
@@ -10231,7 +10358,7 @@ tick(); setInterval(tick, 3000);
         if sync_msg:
             self._set_status(str(sync_msg))
         self._refresh_pid_tree(tree)
-        msg = f'已删除并拉黑 {unique_id} (ID={pid})'
+        msg = f'已拉黑并停用 {unique_id}，永久编号 ID={pid} 已保留'
         if sync_msg:
             msg += f'\n\n服务器同步: {sync_msg}'
         messagebox.showinfo('完成', msg)
@@ -10243,7 +10370,7 @@ tick(); setInterval(tick, 3000);
             return
         vals = tree.item(sel[0], 'values')
         pid, unique_id = vals[0], vals[1]
-        confirm = messagebox.askyesno('确认', f'是否删除 {unique_id} 并释放 ID={pid} ?')
+        confirm = messagebox.askyesno('确认', f'是否停用 {unique_id}？永久编号 ID={pid} 将永久保留。')
         if not confirm:
             return
         db.delete_user(unique_id)
@@ -10252,7 +10379,7 @@ tick(); setInterval(tick, 3000);
         if sync_msg:
             self._set_status(str(sync_msg))
         self._refresh_pid_tree(tree)
-        msg = f'已删除 {unique_id} 并释放 ID={pid}'
+        msg = f'已停用 {unique_id}，永久编号 ID={pid} 已保留'
         if sync_msg:
             msg += f'\n\n服务器同步: {sync_msg}'
         messagebox.showinfo('完成', msg)
@@ -10265,7 +10392,7 @@ tick(); setInterval(tick, 3000);
         if total == 0:
             messagebox.showinfo('提示', '当前没有永久编号数据')
             return
-        if not messagebox.askyesno('确认', f'确认删除全部 {total} 条永久编号吗？此操作不可撤销。'):
+        if not messagebox.askyesno('确认', f'确认停用全部 {total} 个客户吗？永久编号历史不会删除或复用。'):
             return
         snapshot_path, snapshot_count = self._snapshot_local_permanent_ids_backup("before_local_clear_all")
         deleted = db.delete_all_users()
@@ -10273,10 +10400,10 @@ tick(); setInterval(tick, 3000);
         self.guest_message_counter.clear()
         self.today_guest_rank.clear()
         self._sync_local_permanent_ids_backup("pid_delete_all")
-        sync_msg = "服务器保留原有永久编号，未跟随本地执行全部清空"
+        sync_msg = "永久编号历史已保留，未执行物理删除"
         self._set_status(str(sync_msg))
         self._refresh_pid_tree(tree)
-        msg = f'已删除 {deleted} 条永久编号'
+        msg = f'已停用 {deleted} 个客户，永久编号历史已保留'
         if sync_msg:
             msg += f'\n\n服务器同步: {sync_msg}'
         if snapshot_path and snapshot_count > 0:
@@ -10287,21 +10414,21 @@ tick(); setInterval(tick, 3000);
         """Claim pending jobs in time windows and dispatch them to worker queue."""
         while True:
             try:
+                available = int(self.print_task_queue.maxsize) - int(self.print_task_queue.qsize())
+                if available <= 0:
+                    time.sleep(0.05)
+                    continue
                 rows = db.fetch_pending_jobs_batch(
                     window_seconds=self.print_batch_window_seconds,
-                    limit=self.print_batch_limit,
+                    limit=min(self.print_batch_limit, available),
                 )
                 if not rows:
                     time.sleep(0.1)
                     continue
                 for row in rows:
                     self.print_task_queue.put(row)
-            except Exception:
-                try:
-                    # silent fail-safe
-                    pass
-                except Exception:
-                    pass
+            except Exception as exc:
+                self._audit("print_dispatcher_exception", str(exc))
                 time.sleep(0.2)
 
     def _print_worker(self):
@@ -10311,6 +10438,9 @@ tick(); setInterval(tick, 3000);
                 row = self.print_task_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            jid = None
+            trace_id = ""
+            sent_to_printer = False
             try:
                 # row: (id, permanent_id, unique_id, display_name, time, content, rendered, printer, printer_size, trace_id)
                 if len(row) >= 10:
@@ -10360,34 +10490,28 @@ tick(); setInterval(tick, 3000);
                 selected_printer = str(getattr(self, "selected_printer_cached", "") or "").strip()
                 default_printer = printer_utils.get_default_printer()
                 candidates = []
-                use_default = bool(getattr(self, "use_default_printer_cached", True))
-                if use_default:
-                    ordered = [default_printer, str(printer or "").strip(), selected_printer]
+                job_printer = str(printer or "").strip()
+                if job_printer:
+                    candidates.append(job_printer)
                 else:
-                    ordered = [str(printer or "").strip(), selected_printer, default_printer]
-                for p in ordered:
-                    if p and p not in candidates:
-                        candidates.append(p)
+                    # Legacy jobs did not snapshot a default printer name.
+                    use_default = bool(getattr(self, "use_default_printer_cached", True))
+                    legacy_target = default_printer if use_default else selected_printer
+                    if legacy_target:
+                        candidates.append(legacy_target)
 
                 used_printer = ""
                 failure_details = []
                 width_mm = None
                 height_mm = None
-                try:
-                    if printer_size and "x" in str(printer_size).lower():
-                        p = str(printer_size).lower().replace("mm", "").replace(" ", "").split("x")
-                        if len(p) >= 2:
-                            width_mm = int(float(p[0]))
-                            height_mm = int(float(p[1]))
-                except Exception:
-                    width_mm = None
-                    height_mm = None
-                if width_mm is None or height_mm is None:
-                    try:
-                        width_mm = int(float(str(self.settings.get("custom_paper_width_mm", "40")).strip()))
-                        height_mm = int(float(str(self.settings.get("custom_paper_height_mm", "30")).strip()))
-                    except Exception:
-                        width_mm, height_mm = 40, 30
+                if printer_size:
+                    width_mm, height_mm = printer_utils.parse_paper_size_mm(printer_size, default=(0.0, 0.0))
+                if not width_mm or not height_mm:
+                    width_mm, height_mm = printer_utils.parse_paper_size_mm(
+                        f"{self.settings.get('custom_paper_width_mm', '40')}x{self.settings.get('custom_paper_height_mm', '30')}"
+                    )
+                if candidates:
+                    db.mark_job_processing(jid)
                 for target_printer in candidates:
                     attempts = 0
                     lock = self.printer_locks[target_printer]
@@ -10410,14 +10534,15 @@ tick(); setInterval(tick, 3000);
                                 )
                                 if not success and detail:
                                     failure_details.append(f"[{target_printer}] {detail}")
-                            except Exception:
+                            except Exception as exc:
                                 success = False
-                                failure_details.append(f"[{target_printer}] unexpected_exception")
+                                failure_details.append(f"[{target_printer}] unexpected_exception:{exc}")
                             attempts += 1
                             if not success:
                                 time.sleep(0.2)
                     if success:
                         used_printer = target_printer
+                        sent_to_printer = True
                         break
 
                 if success:
@@ -10437,11 +10562,17 @@ tick(); setInterval(tick, 3000);
                         "打印失败告警",
                         f"JID:{jid}\n客户:{display_name} ({unique_id})\n永久ID:{pid}\n原因:{fail_reason[:300]}",
                     )
-            except Exception:
-                try:
-                    pass
-                except Exception:
-                    pass
+            except Exception as exc:
+                if jid is not None:
+                    reason = f"print_worker_exception:{exc}"
+                    try:
+                        if sent_to_printer:
+                            db.mark_job_printed(jid)
+                        else:
+                            db.mark_job_failed(jid, reason)
+                    except Exception:
+                        pass
+                    self._audit("print_worker_exception", f"jid={jid}|trace={trace_id}|error={exc}")
             finally:
                 try:
                     self.print_task_queue.task_done()

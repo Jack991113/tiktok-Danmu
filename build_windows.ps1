@@ -41,7 +41,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to install PyInstaller."
 }
 
-$buildArgs = @("-m", "PyInstaller", "--onefile", "--noconsole", "--name", $Name, $Entry)
+$buildArgs = @("-m", "PyInstaller", "--onefile", "--noconsole", "--collect-all", "playwright", "--name", $Name, $Entry)
 if ($Icon -ne '') {
     $buildArgs += @("--icon", $Icon)
 }

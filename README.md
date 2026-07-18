@@ -27,6 +27,7 @@ Public TikTok comment-printing build for GitHub
 - 打印机与纸张尺寸配置
 - 本地数据库与本地设置
 - 本地代理配置
+- 可见 Chrome 浏览器会话与持久登录状态
 
 ### 这个版本移除了什么
 
@@ -58,6 +59,14 @@ py -3.10 -m pip install -r requirements.txt -r requirements-win.txt
 ```powershell
 py -3.10 app.py
 ```
+
+浏览器会话模式需要电脑已安装 Google Chrome。在“监听模式”选择“浏览器会话”后点击开始监听，程序会打开真实直播间页面，并复用浏览器 Cookie 和 User-Agent 建立弹幕连接。浏览器登录状态保存在本机 `%LOCALAPPDATA%\SenNails\tiktok_browser_profile`，不要将该目录上传或分享。
+
+### 热敏纸实寸打印
+
+- `W×H` 表示最终热敏纸物理宽高，例如 `40×30mm` 不会自动交换方向。
+- 画布位置和尺寸按毫米一比一映射，字号按 `pt` 输出；打印机驱动未接受指定纸张时任务会失败，不会静默缩放到其他纸张。
+- 打印机不可打印边缘仍受硬件限制。请把元素放在设计器的边距参考线内，并先用“测试打印”和“打印校准向导”实测。
 
 4. 构建公开版 exe
 
@@ -132,6 +141,7 @@ It is suitable for:
 - printer and paper-size configuration
 - local database and local settings
 - local proxy configuration
+- visible persistent Chrome sessions for live-room listening
 
 ### What this build removes
 
@@ -163,6 +173,14 @@ py -3.10 -m pip install -r requirements.txt -r requirements-win.txt
 ```powershell
 py -3.10 app.py
 ```
+
+Browser-session mode requires Google Chrome. Select `浏览器会话` in the listening-mode selector and start listening. The app opens the real LIVE room and reuses that browser session's cookies and user agent for the comment connection. Browser login state stays on the local machine and must not be uploaded or shared.
+
+### Physical-size thermal printing
+
+- `W x H` is the final physical label size; `40 x 30mm` is not silently rotated.
+- Canvas geometry maps to millimeters at 1:1 scale and font sizes are printed in points. A driver that rejects the requested media size causes a failed job instead of hidden scaling.
+- Hardware non-printable edges still apply. Keep elements inside the designer margin guide and verify each printer with test printing and the calibration wizard.
 
 4. Build the public executable
 

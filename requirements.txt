@@ -1,3 +1,4 @@
-TikTokLive
+TikTokLive==6.6.5
 openpyxl
 cryptography
+playwright>=1.50,<2

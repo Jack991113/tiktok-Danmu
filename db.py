@@ -27,17 +27,44 @@ DB_PATH = _default_db_path()
 _lock = threading.Lock()
 
 
+def backup_to(destination_path: str) -> None:
+    with _lock:
+        source = sqlite3.connect(DB_PATH)
+        destination = sqlite3.connect(destination_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+
+def restore_from(source_path: str) -> None:
+    with _lock:
+        source = sqlite3.connect(source_path)
+        destination = sqlite3.connect(DB_PATH)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+
 def init_db() -> None:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         cur = conn.cursor()
         cur.execute(
             """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             unique_id TEXT UNIQUE,
+            platform_user_id TEXT,
             display_name TEXT,
-            permanent_id INTEGER UNIQUE
+            permanent_id INTEGER UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 1
         )
         """
         )
@@ -48,6 +75,51 @@ def init_db() -> None:
         )
         """
         )
+        cur.execute("PRAGMA table_info(users)")
+        user_cols = [r[1] for r in cur.fetchall()]
+        if 'is_active' not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+        if 'platform_user_id' not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN platform_user_id TEXT")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_platform_user_id "
+            "ON users(platform_user_id) WHERE platform_user_id IS NOT NULL AND platform_user_id != ''"
+        )
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS permanent_id_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT
+        )
+        """
+        )
+        cur.execute(
+            "SELECT MAX(permanent_id) FROM ("
+            "SELECT permanent_id FROM users UNION ALL SELECT permanent_id FROM freed_pids"
+            ")"
+        )
+        existing_max_pid = int(cur.fetchone()[0] or 0)
+        if existing_max_pid > 0:
+            cur.execute("INSERT OR IGNORE INTO permanent_id_allocations(id) VALUES (?)", (existing_max_pid,))
+        cur.execute(
+            """
+        CREATE TABLE IF NOT EXISTS comment_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_event_id TEXT,
+            room_id TEXT NOT NULL DEFAULT '',
+            unique_id TEXT NOT NULL,
+            platform_user_id TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            event_time TEXT NOT NULL,
+            source_tag TEXT NOT NULL DEFAULT 'main',
+            received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        )
+        cur.execute("PRAGMA table_info(comment_events)")
+        comment_cols = [r[1] for r in cur.fetchall()]
+        if 'platform_user_id' not in comment_cols:
+            cur.execute("ALTER TABLE comment_events ADD COLUMN platform_user_id TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
         CREATE TABLE IF NOT EXISTS blacklist (
@@ -103,43 +175,79 @@ def init_db() -> None:
         if 'trace_id' not in cols:
             cur.execute("ALTER TABLE print_jobs ADD COLUMN trace_id TEXT DEFAULT ''")
             conn.commit()
+        if 'comment_event_id' not in cols:
+            cur.execute("ALTER TABLE print_jobs ADD COLUMN comment_event_id INTEGER")
+            conn.commit()
         # Speed up reconnect dedupe query on large history.
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_print_jobs_uid_msg_status_time "
             "ON print_jobs(unique_id, raw_message, status, printed_at, created_at)"
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_trace_id ON print_jobs(trace_id)")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_comment_events_platform_event "
+            "ON comment_events(room_id, platform_event_id) WHERE platform_event_id IS NOT NULL"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_comment_events_received ON comment_events(id, received_at)")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_print_jobs_comment_event "
+            "ON print_jobs(comment_event_id) WHERE comment_event_id IS NOT NULL"
+        )
         conn.commit()
-        # Crash-safe recovery: move stale/in-flight jobs back to pending on startup.
-        cur.execute("UPDATE print_jobs SET status = 'pending' WHERE status = 'processing'")
+        # Claimed jobs never reached a printer; processing jobs may already be spooled.
+        cur.execute("UPDATE print_jobs SET status = 'pending' WHERE status = 'claimed'")
+        cur.execute(
+            """
+            UPDATE print_jobs
+            SET status = 'uncertain',
+                fail_reason = 'application stopped during printing; manual confirmation required before retry'
+            WHERE status = 'processing'
+            """
+        )
         conn.commit()
         conn.close()
 
 
-def get_or_create_user(unique_id: str, display_name: Optional[str] = None) -> Tuple[int, int]:
+def get_or_create_user(
+    unique_id: str,
+    display_name: Optional[str] = None,
+    platform_user_id: str = "",
+) -> Tuple[int, int]:
     """Return (db_id, permanent_id). Create user if missing."""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT id, permanent_id FROM users WHERE unique_id = ?", (unique_id,))
-        row = cur.fetchone()
+        stable_id = str(platform_user_id or "").strip()
+        if stable_id:
+            cur.execute("SELECT id, permanent_id FROM users WHERE platform_user_id = ?", (stable_id,))
+            row = cur.fetchone()
+        else:
+            row = None
+        if row is None:
+            cur.execute("SELECT id, permanent_id FROM users WHERE unique_id = ?", (unique_id,))
+            row = cur.fetchone()
         if row:
+            try:
+                cur.execute(
+                    "UPDATE users SET unique_id = ?, platform_user_id = COALESCE(NULLIF(?, ''), platform_user_id), display_name = ?, is_active = 1 WHERE id = ?",
+                    (unique_id, stable_id, display_name or "", row[0]),
+                )
+            except sqlite3.IntegrityError:
+                cur.execute(
+                    "UPDATE users SET platform_user_id = COALESCE(NULLIF(?, ''), platform_user_id), display_name = ?, is_active = 1 WHERE id = ?",
+                    (stable_id, display_name or "", row[0]),
+                )
+            conn.commit()
             conn.close()
             return row[0], row[1]
 
-        # prefer reusing a freed permanent_id
-        cur.execute("SELECT permanent_id FROM freed_pids ORDER BY permanent_id LIMIT 1")
-        freed = cur.fetchone()
-        if freed:
-            next_pid = int(freed[0])
-            cur.execute("DELETE FROM freed_pids WHERE permanent_id = ?", (next_pid,))
-        else:
-            # compute next permanent_id
-            cur.execute("SELECT MAX(permanent_id) FROM users")
-            m = cur.fetchone()[0] or 0
-            next_pid = m + 1
+        cur.execute("INSERT INTO permanent_id_allocations DEFAULT VALUES")
+        next_pid = int(cur.lastrowid)
 
-        cur.execute("INSERT INTO users (unique_id, display_name, permanent_id) VALUES (?, ?, ?)", (unique_id, display_name or "", next_pid))
+        cur.execute(
+            "INSERT INTO users (unique_id, platform_user_id, display_name, permanent_id, is_active) VALUES (?, ?, ?, ?, 1)",
+            (unique_id, stable_id or None, display_name or "", next_pid),
+        )
         conn.commit()
         db_id = cur.lastrowid
         conn.close()
@@ -157,6 +265,43 @@ def get_user_by_unique_id(unique_id: str) -> Optional[Tuple[int, str]]:
         if not row:
             return None
         return int(row[0]), (row[1] or "")
+
+
+def get_user_by_identity(unique_id: str, platform_user_id: str = "") -> Optional[Tuple[int, str]]:
+    """Resolve by stable platform ID first and bind legacy username records on first sight."""
+    uid = str(unique_id or "").strip()
+    stable_id = str(platform_user_id or "").strip()
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        row = None
+        if stable_id:
+            cur.execute(
+                "SELECT id, permanent_id, display_name FROM users WHERE platform_user_id = ?",
+                (stable_id,),
+            )
+            row = cur.fetchone()
+        if row is None and uid:
+            cur.execute(
+                "SELECT id, permanent_id, display_name FROM users WHERE unique_id = ?",
+                (uid,),
+            )
+            row = cur.fetchone()
+            if row and stable_id:
+                cur.execute(
+                    "UPDATE users SET platform_user_id = ? WHERE id = ? AND (platform_user_id IS NULL OR platform_user_id = '')",
+                    (stable_id, row[0]),
+                )
+        if row and uid:
+            try:
+                cur.execute("UPDATE users SET unique_id = ?, is_active = 1 WHERE id = ?", (uid, row[0]))
+            except sqlite3.IntegrityError:
+                cur.execute("UPDATE users SET is_active = 1 WHERE id = ?", (row[0],))
+        conn.commit()
+        conn.close()
+        if not row:
+            return None
+        return int(row[1]), str(row[2] or "")
 
 
 def upsert_user_fixed_permanent_id(unique_id: str, display_name: str, permanent_id: int) -> Tuple[bool, str]:
@@ -178,7 +323,7 @@ def upsert_user_fixed_permanent_id(unique_id: str, display_name: str, permanent_
             if current_pid != pid:
                 conn.close()
                 return False, f"unique_id_conflict:{current_pid}"
-            cur.execute("UPDATE users SET display_name = ? WHERE unique_id = ?", (name, uid))
+            cur.execute("UPDATE users SET display_name = ?, is_active = 1 WHERE unique_id = ?", (name, uid))
             conn.commit()
             conn.close()
             return True, "updated"
@@ -188,9 +333,10 @@ def upsert_user_fixed_permanent_id(unique_id: str, display_name: str, permanent_
             conn.close()
             return False, f"permanent_id_conflict:{taken[0]}"
         cur.execute(
-            "INSERT INTO users (unique_id, display_name, permanent_id) VALUES (?, ?, ?)",
+            "INSERT INTO users (unique_id, display_name, permanent_id, is_active) VALUES (?, ?, ?, 1)",
             (uid, name, pid),
         )
+        cur.execute("INSERT OR IGNORE INTO permanent_id_allocations(id) VALUES (?)", (pid,))
         conn.commit()
         conn.close()
         return True, "inserted"
@@ -239,7 +385,7 @@ def list_users() -> List[Tuple[str, Optional[str], int]]:
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT unique_id, display_name, permanent_id FROM users ORDER BY permanent_id")
+        cur.execute("SELECT unique_id, display_name, permanent_id FROM users WHERE is_active = 1 ORDER BY permanent_id")
         rows = cur.fetchall()
         conn.close()
         return rows
@@ -253,7 +399,7 @@ def list_users_dicts() -> List[dict]:
 
 
 def delete_user(unique_id: str) -> Optional[int]:
-    """Delete user by unique_id and free their permanent_id for reuse. Returns freed permanent_id or None."""
+    """Deactivate a user while permanently retaining their assigned number."""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -263,30 +409,27 @@ def delete_user(unique_id: str) -> Optional[int]:
             conn.close()
             return None
         pid = int(row[0])
-        cur.execute("DELETE FROM users WHERE unique_id = ?", (unique_id,))
-        # Add to freed pool
-        cur.execute("INSERT OR IGNORE INTO freed_pids (permanent_id) VALUES (?)", (pid,))
+        cur.execute("UPDATE users SET is_active = 0 WHERE unique_id = ?", (unique_id,))
         conn.commit()
         conn.close()
         return pid
 
 
 def delete_all_users() -> int:
-    """Delete all user mappings and clear freed pool. Returns deleted count."""
+    """Deactivate all mappings without deleting permanent-number history."""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
+        cur.execute("SELECT COUNT(*) FROM users WHERE is_active = 1")
         count = int(cur.fetchone()[0] or 0)
-        cur.execute("DELETE FROM users")
-        cur.execute("DELETE FROM freed_pids")
+        cur.execute("UPDATE users SET is_active = 0 WHERE is_active = 1")
         conn.commit()
         conn.close()
         return count
 
 
 def blacklist_and_remove(unique_id: str) -> Tuple[bool, Optional[int]]:
-    """Add user to blacklist and remove their user mapping (free ID). Returns (blacklisted, freed_pid)."""
+    """Blacklist and deactivate a user without reusing their permanent number."""
     add_blacklist(unique_id)
     freed = delete_user(unique_id)
     return True, freed
@@ -304,23 +447,74 @@ def add_print_job(
     raw_message: str = '',
     rule_hit: str = '',
     trace_id: str = '',
+    comment_event_id: Optional[int] = None,
 ) -> int:
     """Insert a print job into DB and return job id."""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO print_jobs (permanent_id, unique_id, display_name, time, content, raw_message, rule_hit, rendered, printer, printer_size, trace_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-            (permanent_id, unique_id, display_name or '', when, content or '', raw_message or '', rule_hit or '', rendered or '', printer or '', printer_size or '', trace_id or ''),
+            "INSERT OR IGNORE INTO print_jobs (permanent_id, unique_id, display_name, time, content, raw_message, rule_hit, rendered, printer, printer_size, trace_id, comment_event_id, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            (permanent_id, unique_id, display_name or '', when, content or '', raw_message or '', rule_hit or '', rendered or '', printer or '', printer_size or '', trace_id or '', comment_event_id),
         )
         conn.commit()
-        jid = cur.lastrowid
+        jid = int(cur.lastrowid or 0)
+        if jid == 0 and comment_event_id is not None:
+            cur.execute("SELECT id FROM print_jobs WHERE comment_event_id = ?", (comment_event_id,))
+            row = cur.fetchone()
+            jid = int(row[0]) if row else 0
         conn.close()
         return jid
 
 
+def record_comment_event(
+    platform_event_id: str,
+    room_id: str,
+    unique_id: str,
+    platform_user_id: str,
+    display_name: str,
+    content: str,
+    event_time: str,
+    source_tag: str = "main",
+) -> Tuple[int, bool]:
+    """Persist one comment and return (monotonic ingest id, was_inserted)."""
+    event_key = str(platform_event_id or "").strip() or None
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO comment_events
+                (platform_event_id, room_id, unique_id, platform_user_id, display_name, content, event_time, source_tag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_key,
+                str(room_id or ""),
+                str(unique_id or ""),
+                str(platform_user_id or ""),
+                str(display_name or ""),
+                str(content or ""),
+                str(event_time or ""),
+                str(source_tag or "main"),
+            ),
+        )
+        inserted = cur.rowcount == 1
+        event_id = int(cur.lastrowid or 0)
+        if not inserted and event_key is not None:
+            cur.execute(
+                "SELECT id FROM comment_events WHERE room_id = ? AND platform_event_id = ?",
+                (str(room_id or ""), event_key),
+            )
+            row = cur.fetchone()
+            event_id = int(row[0]) if row else 0
+        conn.commit()
+        conn.close()
+        return event_id, inserted
+
+
 def fetch_next_pending_job() -> Optional[Tuple[int, int, str, str, str, str, str, str, str]]:
-    """Fetch the oldest pending job and mark it as 'processing'. Returns the row or None.
+    """Fetch the oldest pending job and mark it as 'claimed'. Returns the row or None.
     Row format: (id, permanent_id, unique_id, display_name, time, content, rendered, printer)"""
     with _lock:
         conn = sqlite3.connect(DB_PATH)
@@ -331,19 +525,19 @@ def fetch_next_pending_job() -> Optional[Tuple[int, int, str, str, str, str, str
             conn.close()
             return None
         jid = row[0]
-        cur.execute("UPDATE print_jobs SET status = 'processing' WHERE id = ?", (jid,))
+        cur.execute("UPDATE print_jobs SET status = 'claimed' WHERE id = ?", (jid,))
         conn.commit()
         conn.close()
         return row
 
 
 def fetch_pending_jobs_batch(window_seconds: int = 5, limit: int = 50) -> List[Tuple[int, int, str, str, str, str, str, str, str, str]]:
-    """Fetch a pending batch by created_at time window and mark them as processing.
+    """Fetch a pending batch by created_at time window and mark them as claimed.
 
     Strategy:
     1. Find the oldest pending job's created_at.
     2. Claim jobs whose created_at falls within [oldest, oldest + window_seconds], up to limit.
-    3. Mark claimed jobs as processing atomically under DB lock.
+    3. Mark jobs as claimed atomically under DB lock.
     """
     win = max(1, int(window_seconds))
     lim = max(1, int(limit))
@@ -390,10 +584,22 @@ def fetch_pending_jobs_batch(window_seconds: int = 5, limit: int = 50) -> List[T
             return []
         ids = [r[0] for r in rows]
         placeholders = ",".join("?" for _ in ids)
-        cur.execute(f"UPDATE print_jobs SET status = 'processing' WHERE id IN ({placeholders})", ids)
+        cur.execute(f"UPDATE print_jobs SET status = 'claimed' WHERE id IN ({placeholders})", ids)
         conn.commit()
         conn.close()
         return rows
+
+
+def mark_job_processing(job_id: int) -> None:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("UPDATE print_jobs SET status = 'processing' WHERE id = ? AND status = 'claimed'", (job_id,))
+        if cur.rowcount != 1:
+            conn.close()
+            raise RuntimeError(f"print job {job_id} is not claimed")
+        conn.commit()
+        conn.close()
 
 
 def mark_job_printed(job_id: int) -> None:
@@ -431,6 +637,19 @@ def list_print_jobs(status: Optional[str] = None) -> List[Tuple]:
         return rows
 
 
+def count_print_jobs(status: Optional[str] = None) -> int:
+    with _lock:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        if status:
+            cur.execute("SELECT COUNT(*) FROM print_jobs WHERE status = ?", (status,))
+        else:
+            cur.execute("SELECT COUNT(*) FROM print_jobs")
+        count = int(cur.fetchone()[0] or 0)
+        conn.close()
+        return count
+
+
 def run_maintenance() -> dict:
     """Run lightweight DB maintenance and return summary."""
     with _lock:
@@ -461,14 +680,16 @@ def get_today_print_summary() -> dict:
             """
             SELECT
                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='claimed' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='uncertain' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='printed' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)
             FROM print_jobs
             WHERE date(created_at, 'localtime') = date('now', 'localtime')
             """
         )
-        p, pr, ok, f = cur.fetchone() or (0, 0, 0, 0)
+        p, claimed, pr, uncertain, ok, f = cur.fetchone() or (0, 0, 0, 0, 0, 0)
         cur.execute(
             """
             SELECT fail_reason, COUNT(*)
@@ -484,7 +705,9 @@ def get_today_print_summary() -> dict:
         conn.close()
         return {
             'pending': int(p or 0),
+            'claimed': int(claimed or 0),
             'processing': int(pr or 0),
+            'uncertain': int(uncertain or 0),
             'printed': int(ok or 0),
             'failed': int(f or 0),
             'top_fail_reasons': reasons,
@@ -507,67 +730,6 @@ def get_recent_failed_count(seconds: int = 60) -> int:
         v = cur.fetchone()[0] or 0
         conn.close()
         return int(v)
-
-
-def has_recent_printed(unique_id: str, raw_message: str, seconds: int = 20) -> bool:
-    """Whether the same user's same message was printed successfully in recent seconds."""
-    uid = str(unique_id or "").strip()
-    msg = str(raw_message or "").strip()
-    if not uid or not msg:
-        return False
-    win = max(1, int(seconds))
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1
-            FROM print_jobs
-            WHERE status = 'printed'
-              AND unique_id = ?
-              AND raw_message = ?
-              AND COALESCE(printed_at, created_at) >= datetime('now', ?)
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (uid, msg, f"-{win} seconds"),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return row is not None
-
-
-def has_recent_job_duplicate(unique_id: str, raw_message: str, seconds: int = 20) -> bool:
-    """Whether same user's same message exists in recent pending/processing/printed jobs."""
-    uid = str(unique_id or "").strip()
-    msg = str(raw_message or "").strip()
-    if not uid or not msg:
-        return False
-    win = max(1, int(seconds))
-    with _lock:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1
-            FROM print_jobs
-            WHERE unique_id = ?
-              AND raw_message = ?
-              AND status IN ('pending', 'processing', 'printed')
-              AND (
-                    CASE
-                      WHEN status = 'printed' THEN COALESCE(printed_at, created_at)
-                      ELSE created_at
-                    END
-                  ) >= datetime('now', ?)
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (uid, msg, f"-{win} seconds"),
-        )
-        row = cur.fetchone()
-        conn.close()
-        return row is not None
 
 
 def reset_job_to_pending(job_id: int) -> None:
@@ -640,6 +802,11 @@ def import_permanent_ids(data_list: List[dict]) -> dict:
                     existing_id, existing_perm = existing
                     if existing_perm != perm_id:
                         conflicts.append(f"{unique_id}: 已存在ID {existing_perm}，导入ID {perm_id} 冲突")
+                    else:
+                        cur.execute(
+                            "UPDATE users SET display_name = ?, is_active = 1 WHERE id = ?",
+                            (display_name, existing_id),
+                        )
                     skipped += 1
                     continue
                 
@@ -655,9 +822,10 @@ def import_permanent_ids(data_list: List[dict]) -> dict:
                 
                 # Insert new user
                 cur.execute(
-                    "INSERT INTO users (unique_id, display_name, permanent_id) VALUES (?, ?, ?)",
+                    "INSERT INTO users (unique_id, display_name, permanent_id, is_active) VALUES (?, ?, ?, 1)",
                     (unique_id, display_name, use_perm_id)
                 )
+                cur.execute("INSERT OR IGNORE INTO permanent_id_allocations(id) VALUES (?)", (use_perm_id,))
                 imported += 1
             except Exception as e:
                 skipped += 1
